@@ -84,6 +84,7 @@ class TargetScopeValidator:
     PROTECTED_DRIVE_NAMES: Set[str] = {
         r"\\.\PhysicalDrive0",
         r"\\.\C:",
+        r"\\.\PhysicalDrive",
         "/dev/sda",
         "/dev/nvme0n1",
         "/dev/root",
@@ -94,7 +95,13 @@ class TargetScopeValidator:
         Initialize validator with optional list of explicitly approved root directories.
         If provided, targets MUST reside within an approved directory tree unless explicitly bypassed.
         """
-        self.approved_roots = [Path(r).resolve() for r in approved_roots] if approved_roots else []
+        self.approved_roots: List[Path] = []
+        if approved_roots:
+            for r in approved_roots:
+                try:
+                    self.approved_roots.append(Path(r).resolve())
+                except Exception:
+                    self.approved_roots.append(Path(r))
 
     def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
         """
@@ -102,10 +109,15 @@ class TargetScopeValidator:
         Rejects critical system targets, root paths, and unapproved scopes.
         """
         raw_str = str(target_path).strip()
-        path = Path(raw_str).resolve() if raw_str else Path(".")
 
-        # 1. Check for raw system block device targets
-        if raw_str in self.PROTECTED_DRIVE_NAMES:
+        # 1. Check for raw system block device targets before filesystem resolution
+        if (
+            raw_str.startswith(r"\\.\\")
+            or raw_str.startswith(r"\\.\PhysicalDrive")
+            or raw_str.startswith("/dev/sd")
+            or raw_str.startswith("/dev/nvme")
+            or raw_str in self.PROTECTED_DRIVE_NAMES
+        ):
             return TargetScopeInfo(
                 target_path=raw_str,
                 is_safe=False,
@@ -113,6 +125,17 @@ class TargetScopeValidator:
                 size_bytes=0,
                 is_block_device=True,
                 rejection_reason="CRITICAL: Primary OS physical disk or system partition is protected.",
+            )
+
+        try:
+            path = Path(raw_str).resolve() if raw_str else Path(".")
+        except Exception as resolve_err:
+            return TargetScopeInfo(
+                target_path=raw_str,
+                is_safe=False,
+                media_type=StorageMediaType.UNKNOWN,
+                size_bytes=0,
+                rejection_reason=f"Failed to resolve target path: {resolve_err}",
             )
 
         # 2. Check path existence
@@ -132,8 +155,9 @@ class TargetScopeValidator:
         if platform.system() == "Windows":
             for sys_dir in self.PROTECTED_SYSTEM_DIRS_WINDOWS:
                 try:
-                    if path == Path(sys_dir).resolve() or Path(sys_dir).resolve() in path.parents:
-                        # Allow dedicated subfolder in user directory only if inside approved roots or workspace
+                    sys_resolved = Path(sys_dir).resolve()
+                    if path == sys_resolved or sys_resolved in path.parents:
+                        # Allow dedicated subfolder in user directory only if inside approved roots
                         if not self._is_within_approved_roots(path):
                             return TargetScopeInfo(
                                 target_path=resolved_str,
@@ -150,7 +174,8 @@ class TargetScopeValidator:
         else:
             for sys_dir in self.PROTECTED_SYSTEM_DIRS_POSIX:
                 try:
-                    if path == Path(sys_dir).resolve() or (sys_dir != "/" and Path(sys_dir).resolve() in path.parents):
+                    sys_resolved = Path(sys_dir).resolve()
+                    if path == sys_resolved or (sys_dir != "/" and sys_resolved in path.parents):
                         if not self._is_within_approved_roots(path):
                             return TargetScopeInfo(
                                 target_path=resolved_str,
@@ -206,7 +231,6 @@ class TargetScopeValidator:
     def _is_within_approved_roots(self, path: Path) -> bool:
         """Check if path is inside any approved root."""
         if not self.approved_roots:
-            # Default safe fallback: allow current working directory subtrees or designated temp files
             cwd = Path.cwd().resolve()
             if path == cwd or cwd in path.parents:
                 return True
@@ -218,12 +242,10 @@ class TargetScopeValidator:
         """
         Detect underlying storage technology (SSD vs. HDD vs. Dummy File).
         """
-        # If target has dummy/temp naming or is inside test workspace
         filename = path.name.lower()
         if any(marker in filename for marker in ["dummy", "test", "temp", "sample", "fixture"]):
             return StorageMediaType.DUMMY_TEST_FILE
 
-        # Platform-specific hardware query
         if platform.system() == "Windows":
             return self._detect_windows_media_type(path)
         elif platform.system() == "Linux":
@@ -233,7 +255,7 @@ class TargetScopeValidator:
 
     def _detect_windows_media_type(self, path: Path) -> StorageMediaType:
         """Query Windows WMI/PowerShell PhysicalDisk MediaType for the volume."""
-        drive = path.drive  # e.g., "C:"
+        drive = path.drive
         if not drive:
             return StorageMediaType.UNKNOWN
 
@@ -261,7 +283,6 @@ class TargetScopeValidator:
     def _detect_linux_media_type(self, path: Path) -> StorageMediaType:
         """Query Linux sysfs rotational flag (/sys/block/*/queue/rotational)."""
         try:
-            # Check rotational flag: 0 = SSD/Flash, 1 = Rotational HDD
             res = subprocess.check_output(
                 ["df", "--output=source", str(path)],
                 text=True,
