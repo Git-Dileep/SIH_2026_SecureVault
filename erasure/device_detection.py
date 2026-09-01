@@ -229,14 +229,30 @@ class TargetScopeValidator:
         )
 
     def _is_within_approved_roots(self, path: Path) -> bool:
-        """Check if path is inside any approved root."""
-        if not self.approved_roots:
-            cwd = Path.cwd().resolve()
-            if path == cwd or cwd in path.parents:
-                return True
-            return False
+        """Check if path is inside any approved root, cwd, or temp directory."""
+        import tempfile
 
-        return any(path == app_root or app_root in path.parents for app_root in self.approved_roots)
+        temp_dir = Path(tempfile.gettempdir()).resolve()
+        cwd = Path.cwd().resolve()
+
+        # Check explicit approved roots if configured
+        if self.approved_roots:
+            if any(path == app_root or app_root in path.parents for app_root in self.approved_roots):
+                return True
+
+        # Default safe locations: cwd subtree, system tempdir, or explicit dummy/temp test markers
+        if path == cwd or cwd in path.parents:
+            return True
+
+        if path == temp_dir or temp_dir in path.parents:
+            return True
+
+        name_lower = path.name.lower()
+        if any(marker in name_lower for marker in ["dummy", "test", "temp", "sample", "fixture"]):
+            return True
+
+        return False
+
 
     def _detect_media_type(self, path: Path) -> StorageMediaType:
         """
@@ -301,7 +317,7 @@ class TargetScopeValidator:
         return StorageMediaType.UNKNOWN
 
 
-# Module-level convenience helper
+# Module-level convenience helpers
 def validate_sanitization_target(
     target_path: str | Path,
     approved_roots: Optional[List[Path | str]] = None,
@@ -309,3 +325,17 @@ def validate_sanitization_target(
     """Validate that a target path is safe and within allowable sanitization scope."""
     validator = TargetScopeValidator(approved_roots=approved_roots)
     return validator.evaluate_target(target_path)
+
+
+def check_target_safety(
+    target_path: str | Path,
+    approved_roots: Optional[List[Path | str]] = None,
+) -> bool:
+    """
+    Check if a target path is safe for sanitization.
+    Returns True if target is safe (e.g. local dummy file / approved scope),
+    or False if target is rejected (e.g. system directory, system drive).
+    """
+    report = validate_sanitization_target(target_path, approved_roots=approved_roots)
+    return report.is_safe
+

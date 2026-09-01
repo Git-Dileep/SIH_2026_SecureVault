@@ -17,6 +17,7 @@ from erasure.device_detection import (
     StorageMediaType,
     TargetScopeInfo,
     TargetScopeValidator,
+    check_target_safety,
     validate_sanitization_target,
 )
 
@@ -32,5 +33,7 @@ __all__ = [
     "StorageMediaType",
     "TargetScopeInfo",
     "TargetScopeValidator",
+    "check_target_safety",
     "validate_sanitization_target",
 ]
+
