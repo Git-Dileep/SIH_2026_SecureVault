@@ -229,16 +229,15 @@ class TargetScopeValidator:
         )
 
     def _is_within_approved_roots(self, path: Path) -> bool:
-        """Check if path is inside any approved root, cwd, or temp directory."""
+        """Check if path is inside approved roots or default safe test scopes."""
         import tempfile
+
+        # If explicit approved roots are configured, enforce strict containment
+        if self.approved_roots:
+            return any(path == app_root or app_root in path.parents for app_root in self.approved_roots)
 
         temp_dir = Path(tempfile.gettempdir()).resolve()
         cwd = Path.cwd().resolve()
-
-        # Check explicit approved roots if configured
-        if self.approved_roots:
-            if any(path == app_root or app_root in path.parents for app_root in self.approved_roots):
-                return True
 
         # Default safe locations: cwd subtree, system tempdir, or explicit dummy/temp test markers
         if path == cwd or cwd in path.parents:
@@ -252,6 +251,7 @@ class TargetScopeValidator:
             return True
 
         return False
+
 
 
     def _detect_media_type(self, path: Path) -> StorageMediaType:

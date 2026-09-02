@@ -129,8 +129,7 @@ class Sanitizer:
         """
         job_id = f"san-{uuid.uuid4().hex[:12]}"
         start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        raw_path = Path(target_path)
-        resolved_path = raw_path.resolve() if raw_path.exists() else raw_path
+        target_str = str(target_path)
 
         # Normalize algorithm parameter
         if isinstance(algorithm, str):
@@ -145,11 +144,11 @@ class Sanitizer:
         # Step 1: Scope & Safety Validation
         # ---------------------------------------------------------------------
         scope_info = validate_sanitization_target(
-            resolved_path, approved_roots=self.approved_roots
+            target_path, approved_roots=self.approved_roots
         )
 
         device_dict = {
-            "name": str(resolved_path),
+            "name": target_str,
             "type": scope_info.media_type.value if scope_info else "Unknown",
             "serial": "N/A",
             "capacity_bytes": scope_info.size_bytes if scope_info else 0,
@@ -157,10 +156,14 @@ class Sanitizer:
 
         if not scope_info.is_safe:
             end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            try:
+                filename = Path(target_str).name if not target_str.startswith(r"\\") else target_str
+            except Exception:
+                filename = target_str
             return self._build_job_record(
                 job_id=job_id,
-                target_path=str(resolved_path),
-                filename=resolved_path.name,
+                target_path=target_str,
+                filename=filename,
                 size_bytes=scope_info.size_bytes,
                 pre_sha256="N/A (Scope Rejected)",
                 algorithm=algo_enum.value,
@@ -175,6 +178,9 @@ class Sanitizer:
                 verification={"passed": False, "details": scope_info.rejection_reason or "Safety boundary check failed."},
                 error_message=f"Safety Rejection: {scope_info.rejection_reason}",
             )
+
+        resolved_path = Path(target_str).resolve()
+
 
         # Clear read-only flags if present to allow write/rename
         if scope_info.is_read_only:
