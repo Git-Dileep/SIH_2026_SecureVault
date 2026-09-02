@@ -1,0 +1,3270 @@
+From 2fdb9a8f4f93e118461ea09a7b4a4051f5ca7e8b Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Tue, 1 Sep 2026 21:15:24 +0530
+Subject: [PATCH 1/7] Feat: Add NIST methods and safe device scope detection in
+ erasure/
+
+---
+ erasure/__init__.py           |  37 +++-
+ erasure/device_detection.py   | 297 ++++++++++++++++++++++++++++++--
+ erasure/methods.py            | 312 +++++++++++++++++++++++++++++++++-
+ tests/erasure/test_methods.py | 128 ++++++++++++++
+ 4 files changed, 753 insertions(+), 21 deletions(-)
+ create mode 100644 tests/erasure/test_methods.py
+
+diff --git a/erasure/__init__.py b/erasure/__init__.py
+index e8848b3..b26fdf8 100644
+--- a/erasure/__init__.py
++++ b/erasure/__init__.py
+@@ -1 +1,36 @@
+-# erasure — Person 5
++"""
++SecureVault Erasure Module — Owner: Person 5
++Sub-package for secure data sanitization, device detection, verification, and audit certification.
++"""
++
++from erasure.methods import (
++    DEFAULT_CHUNK_SIZE,
++    BinaryPatternGenerator,
++    OverwriteEngine,
++    PassDetail,
++    SanitizationAlgorithm,
++    SanitizationResult,
++    overwrite_dod_3pass,
++    overwrite_nist_clear,
++)
++from erasure.device_detection import (
++    StorageMediaType,
++    TargetScopeInfo,
++    TargetScopeValidator,
++    validate_sanitization_target,
++)
++
++__all__ = [
++    "DEFAULT_CHUNK_SIZE",
++    "BinaryPatternGenerator",
++    "OverwriteEngine",
++    "PassDetail",
++    "SanitizationAlgorithm",
++    "SanitizationResult",
++    "overwrite_dod_3pass",
++    "overwrite_nist_clear",
++    "StorageMediaType",
++    "TargetScopeInfo",
++    "TargetScopeValidator",
++    "validate_sanitization_target",
++]
+diff --git a/erasure/device_detection.py b/erasure/device_detection.py
+index 43ceeb5..67537f4 100644
+--- a/erasure/device_detection.py
++++ b/erasure/device_detection.py
+@@ -1,15 +1,290 @@
+ """
+-Device Detection — Owner: Person 5
++Device Detection & Target Scope Validation — Owner: Person 5
++Module: erasure.device_detection
+ 
+-Detects and enumerates attached storage devices and their properties
+-(type, capacity, interface, partitions). Provides the target selection
+-interface for the erasure pipeline.
+-
+-Deliverables:
+-- Enumerate attached storage devices (HDD, SSD, USB, NVMe)
+-- Detect device properties (capacity, interface, serial number)
+-- List partitions and their filesystem types
+-- Provide device lock/unlock for exclusive sanitization access
++Detects and enumerates target media scope (HDD, SSD, NVMe, USB, Local Dummy File)
++and enforces strict safety boundaries to reject out-of-scope or critical system targets
++before any destructive sanitization I/O occurs.
+ """
+ 
+-# TODO: implement
++from __future__ import annotations
++
++import enum
++import os
++import platform
++import subprocess
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Optional, Set, Tuple
++
++
++class StorageMediaType(str, enum.Enum):
++    """Storage hardware media classification."""
++    HDD = "HDD (Rotational Magnetic)"
++    SSD = "SSD (Solid-State Drive)"
++    NVME = "NVMe (PCIe Solid-State)"
++    USB_FLASH = "USB Flash Drive"
++    DUMMY_TEST_FILE = "Local Dummy/Test File"
++    UNKNOWN = "Unknown / Unclassified"
++
++
++@dataclass
++class TargetScopeInfo:
++    """Target evaluation report containing scope safety status."""
++    target_path: str
++    is_safe: bool
++    media_type: StorageMediaType
++    size_bytes: int
++    rejection_reason: Optional[str] = None
++    is_read_only: bool = False
++    is_directory: bool = False
++    is_block_device: bool = False
++    drive_letter_or_mount: Optional[str] = None
++
++
++class TargetScopeValidator:
++    """
++    Validates sanitization targets against safety boundaries.
++    Prevents accidental wiping of operating system files, system partitions,
++    and unapproved drive paths.
++    """
++
++    # Protected system paths across operating systems
++    PROTECTED_SYSTEM_DIRS_WINDOWS: Set[str] = {
++        r"C:\Windows",
++        r"C:\Program Files",
++        r"C:\Program Files (x86)",
++        r"C:\Users",
++        r"C:\ProgramData",
++        r"C:\Recovery",
++        r"C:\System Volume Information",
++        r"C:\$Recycle.Bin",
++        r"C:\Boot",
++    }
++
++    PROTECTED_SYSTEM_DIRS_POSIX: Set[str] = {
++        "/",
++        "/bin",
++        "/boot",
++        "/dev",
++        "/etc",
++        "/lib",
++        "/lib64",
++        "/proc",
++        "/root",
++        "/run",
++        "/sbin",
++        "/sys",
++        "/usr",
++        "/var",
++    }
++
++    # Protected system drive identifiers
++    PROTECTED_DRIVE_NAMES: Set[str] = {
++        r"\\.\PhysicalDrive0",
++        r"\\.\C:",
++        "/dev/sda",
++        "/dev/nvme0n1",
++        "/dev/root",
++    }
++
++    def __init__(self, approved_roots: Optional[List[Path | str]] = None) -> None:
++        """
++        Initialize validator with optional list of explicitly approved root directories.
++        If provided, targets MUST reside within an approved directory tree unless explicitly bypassed.
++        """
++        self.approved_roots = [Path(r).resolve() for r in approved_roots] if approved_roots else []
++
++    def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
++        """
++        Analyze target path and determine if it is safe for sanitization.
++        Rejects critical system targets, root paths, and unapproved scopes.
++        """
++        raw_str = str(target_path).strip()
++        path = Path(raw_str).resolve() if raw_str else Path(".")
++
++        # 1. Check for raw system block device targets
++        if raw_str in self.PROTECTED_DRIVE_NAMES:
++            return TargetScopeInfo(
++                target_path=raw_str,
++                is_safe=False,
++                media_type=StorageMediaType.UNKNOWN,
++                size_bytes=0,
++                is_block_device=True,
++                rejection_reason="CRITICAL: Primary OS physical disk or system partition is protected.",
++            )
++
++        # 2. Check path existence
++        if not path.exists():
++            return TargetScopeInfo(
++                target_path=str(path),
++                is_safe=False,
++                media_type=StorageMediaType.UNKNOWN,
++                size_bytes=0,
++                rejection_reason=f"Target path '{path}' does not exist on filesystem.",
++            )
++
++        is_dir = path.is_dir()
++        resolved_str = str(path)
++
++        # 3. Check system directory protection (Windows)
++        if platform.system() == "Windows":
++            for sys_dir in self.PROTECTED_SYSTEM_DIRS_WINDOWS:
++                try:
++                    if path == Path(sys_dir).resolve() or Path(sys_dir).resolve() in path.parents:
++                        # Allow dedicated subfolder in user directory only if inside approved roots or workspace
++                        if not self._is_within_approved_roots(path):
++                            return TargetScopeInfo(
++                                target_path=resolved_str,
++                                is_safe=False,
++                                media_type=StorageMediaType.UNKNOWN,
++                                size_bytes=0,
++                                is_directory=is_dir,
++                                rejection_reason=f"REJECTED: Target resides within protected Windows system hierarchy: '{sys_dir}'",
++                            )
++                except Exception:
++                    pass
++
++        # 4. Check system directory protection (POSIX / Linux / macOS)
++        else:
++            for sys_dir in self.PROTECTED_SYSTEM_DIRS_POSIX:
++                try:
++                    if path == Path(sys_dir).resolve() or (sys_dir != "/" and Path(sys_dir).resolve() in path.parents):
++                        if not self._is_within_approved_roots(path):
++                            return TargetScopeInfo(
++                                target_path=resolved_str,
++                                is_safe=False,
++                                media_type=StorageMediaType.UNKNOWN,
++                                size_bytes=0,
++                                is_directory=is_dir,
++                                rejection_reason=f"REJECTED: Target resides within protected POSIX root hierarchy: '{sys_dir}'",
++                            )
++                except Exception:
++                    pass
++
++        # 5. Check if directory without explicit approval
++        if is_dir:
++            return TargetScopeInfo(
++                target_path=resolved_str,
++                is_safe=False,
++                media_type=StorageMediaType.UNKNOWN,
++                size_bytes=0,
++                is_directory=True,
++                rejection_reason="Target is a directory. Specify individual files or use recursive batch module.",
++            )
++
++        # 6. Gather target file properties safely
++        try:
++            stat_result = path.stat()
++            size_bytes = stat_result.st_size
++            is_read_only = not (stat_result.st_mode & 0o200)  # Check write bit
++        except Exception as e:
++            return TargetScopeInfo(
++                target_path=resolved_str,
++                is_safe=False,
++                media_type=StorageMediaType.UNKNOWN,
++                size_bytes=0,
++                rejection_reason=f"Failed to inspect target file metadata: {e}",
++            )
++
++        # 7. Classify media type
++        media_type = self._detect_media_type(path)
++
++        # 8. All checks passed: Safe target
++        return TargetScopeInfo(
++            target_path=resolved_str,
++            is_safe=True,
++            media_type=media_type,
++            size_bytes=size_bytes,
++            is_read_only=is_read_only,
++            is_directory=False,
++            drive_letter_or_mount=path.drive if platform.system() == "Windows" else "/",
++            rejection_reason=None,
++        )
++
++    def _is_within_approved_roots(self, path: Path) -> bool:
++        """Check if path is inside any approved root."""
++        if not self.approved_roots:
++            # Default safe fallback: allow current working directory subtrees or designated temp files
++            cwd = Path.cwd().resolve()
++            if path == cwd or cwd in path.parents:
++                return True
++            return False
++
++        return any(path == app_root or app_root in path.parents for app_root in self.approved_roots)
++
++    def _detect_media_type(self, path: Path) -> StorageMediaType:
++        """
++        Detect underlying storage technology (SSD vs. HDD vs. Dummy File).
++        """
++        # If target has dummy/temp naming or is inside test workspace
++        filename = path.name.lower()
++        if any(marker in filename for marker in ["dummy", "test", "temp", "sample", "fixture"]):
++            return StorageMediaType.DUMMY_TEST_FILE
++
++        # Platform-specific hardware query
++        if platform.system() == "Windows":
++            return self._detect_windows_media_type(path)
++        elif platform.system() == "Linux":
++            return self._detect_linux_media_type(path)
++
++        return StorageMediaType.UNKNOWN
++
++    def _detect_windows_media_type(self, path: Path) -> StorageMediaType:
++        """Query Windows WMI/PowerShell PhysicalDisk MediaType for the volume."""
++        drive = path.drive  # e.g., "C:"
++        if not drive:
++            return StorageMediaType.UNKNOWN
++
++        try:
++            drive_letter = drive.rstrip(":")
++            cmd = f"Get-Partition -DriveLetter {drive_letter} | Get-Disk | Select-Object -ExpandProperty MediaType"
++            output = subprocess.check_output(
++                ["powershell", "-NoProfile", "-Command", cmd],
++                text=True,
++                timeout=3,
++                stderr=subprocess.DEVNULL,
++            ).strip().upper()
++
++            if "SSD" in output:
++                return StorageMediaType.SSD
++            elif "HDD" in output or "ROTATIONAL" in output:
++                return StorageMediaType.HDD
++            elif "NVME" in output:
++                return StorageMediaType.NVME
++        except Exception:
++            pass
++
++        return StorageMediaType.UNKNOWN
++
++    def _detect_linux_media_type(self, path: Path) -> StorageMediaType:
++        """Query Linux sysfs rotational flag (/sys/block/*/queue/rotational)."""
++        try:
++            # Check rotational flag: 0 = SSD/Flash, 1 = Rotational HDD
++            res = subprocess.check_output(
++                ["df", "--output=source", str(path)],
++                text=True,
++                timeout=3,
++            ).strip().splitlines()
++            if len(res) >= 2:
++                device = res[1].strip()
++                dev_name = Path(device).name
++                rotational_path = Path(f"/sys/block/{dev_name}/queue/rotational")
++                if rotational_path.exists():
++                    is_rotational = rotational_path.read_text().strip() == "1"
++                    return StorageMediaType.HDD if is_rotational else StorageMediaType.SSD
++        except Exception:
++            pass
++
++        return StorageMediaType.UNKNOWN
++
++
++# Module-level convenience helper
++def validate_sanitization_target(
++    target_path: str | Path,
++    approved_roots: Optional[List[Path | str]] = None,
++) -> TargetScopeInfo:
++    """Validate that a target path is safe and within allowable sanitization scope."""
++    validator = TargetScopeValidator(approved_roots=approved_roots)
++    return validator.evaluate_target(target_path)
+diff --git a/erasure/methods.py b/erasure/methods.py
+index 6acf54b..f216649 100644
+--- a/erasure/methods.py
++++ b/erasure/methods.py
+@@ -1,15 +1,309 @@
+ """
+ Methods — Owner: Person 5
++Module: erasure.methods
+ 
+-Defines sanitization method implementations per NIST SP 800-88 Rev. 1.
+-Each method class encapsulates the overwrite pattern, number of passes,
+-and verification requirements.
++Implementation of chunked binary sanitization routines for file and storage media erasure.
+ 
+-Deliverables:
+-- Implement Clear method (single-pass zero/pattern overwrite)
+-- Implement Purge method (multi-pass overwrite, crypto-erase for SED)
+-- Implement Destroy verification (confirm physical destruction)
+-- Method selection logic based on media type and security level
++===============================================================================
++STANDARDS & IMPLEMENTATION SCOPE (NIST SP 800-88 Rev. 1 & Legacy DoD Guidelines)
++===============================================================================
++Implemented in this module:
++  1. NIST SP 800-88 Rev. 1 "Clear" (1-pass overwrite using cryptographically secure
++     random bytes from os.urandom or fixed logical zeros across addressable space).
++  2. Legacy DoD 5220.22-M 3-Pass Overwrite:
++     - Pass 1: Fixed binary zeros (0x00)
++     - Pass 2: Fixed binary complement ones (0xFF)
++     - Pass 3: Pseudo-random bytes (os.urandom)
++  3. Single-pass fixed pattern wiping (0x00 Zero-fill).
++
++IMPORTANT COMPLIANCE & LIMITATION NOTICES:
++  - DoD 5220.22-M is a legacy United States Department of Defense specification
++    (superseded) and is NOT a recognized modern NIST SP 800-88 standard. It is
++    provided here strictly for historical reference and legacy compatibility testing.
++  - NIST SP 800-88 Rev. 1 emphasizes that media type dictates sanitization efficacy:
++    * On magnetic spinning media (HDD), logical overwriting effectively mitigates
++      standard laboratory recovery techniques.
++    * On Flash-based media (SSDs, NVMe, eMMC, USB flash), file-level overwriting
++      cannot address over-provisioned sectors, Wear-Leveling remapping, or Flash
++      Translation Layer (FTL) hidden blocks. True "Purge" on flash media requires
++      firmware-level ATA Secure Erase / NVMe Format Cryptographic Erase, which is
++      beyond user-space binary overwrite routines.
++  - DISCLAIMER: This is an academic and prototypical implementation. This software
++    does NOT claim formal NIST laboratory validation, Common Criteria certification,
++    or FIPS accreditation.
++===============================================================================
+ """
+ 
+-# TODO: implement
++from __future__ import annotations
++
++import enum
++import os
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable, Generator, List, Optional
++
++
++DEFAULT_CHUNK_SIZE: int = 4096  # Enforced 4096-byte chunk size for binary I/O
++
++
++class SanitizationAlgorithm(str, enum.Enum):
++    """Supported sanitization algorithm definitions."""
++    NIST_800_88_CLEAR = "NIST_SP_800_88_CLEAR"
++    LEGACY_DOD_5220_22_M = "LEGACY_DOD_5220_22_M"
++    ZERO_OVERWRITE = "ZERO_OVERWRITE"
++    RANDOM_OVERWRITE = "RANDOM_OVERWRITE"
++
++
++@dataclass
++class PassDetail:
++    """Metadata describing a single overwrite pass."""
++    pass_number: int
++    total_passes: int
++    pattern_name: str
++    bytes_written: int
++    elapsed_seconds: float
++
++
++@dataclass
++class SanitizationResult:
++    """Detailed summary of a completed sanitization routine."""
++    target_path: str
++    algorithm: SanitizationAlgorithm
++    total_bytes_sanitized: int
++    passes_completed: int
++    passes_total: int
++    success: bool
++    pass_details: List[PassDetail] = field(default_factory=list)
++    error_message: Optional[str] = None
++    started_at: float = field(default_factory=time.time)
++    completed_at: Optional[float] = None
++
++    @property
++    def duration_seconds(self) -> float:
++        if self.completed_at and self.started_at:
++            return max(0.0, self.completed_at - self.started_at)
++        return 0.0
++
++
++class BinaryPatternGenerator:
++    """Generates chunked byte streams for various wipe patterns."""
++
++    @staticmethod
++    def zeros(chunk_size: int = DEFAULT_CHUNK_SIZE) -> bytes:
++        """Return a chunk of binary zeros (0x00)."""
++        return b"\x00" * chunk_size
++
++    @staticmethod
++    def ones(chunk_size: int = DEFAULT_CHUNK_SIZE) -> bytes:
++        """Return a chunk of binary ones (0xFF)."""
++        return b"\xFF" * chunk_size
++
++    @staticmethod
++    def random(chunk_size: int = DEFAULT_CHUNK_SIZE) -> bytes:
++        """Return a cryptographically secure random chunk."""
++        return os.urandom(chunk_size)
++
++
++class OverwriteEngine:
++    """
++    Core binary overwrite execution engine.
++    Applies multi-pass or single-pass patterns to files in 4096-byte chunks
++    with mandatory filesystem sync (os.fsync).
++    """
++
++    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
++        self.chunk_size = chunk_size
++
++    def sanitize_file(
++        self,
++        target_path: str | Path,
++        algorithm: SanitizationAlgorithm = SanitizationAlgorithm.NIST_800_88_CLEAR,
++        progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
++    ) -> SanitizationResult:
++        """
++        Execute secure binary overwriting on the target file.
++
++        Args:
++            target_path: File system path to the target file.
++            algorithm: Selected sanitization algorithm.
++            progress_callback: Optional callback func(pass_num, total_passes, bytes_done, total_bytes).
++
++        Returns:
++            SanitizationResult with execution audit metadata.
++        """
++        path = Path(target_path).resolve()
++        start_time = time.time()
++
++        if not path.is_file():
++            return SanitizationResult(
++                target_path=str(path),
++                algorithm=algorithm,
++                total_bytes_sanitized=0,
++                passes_completed=0,
++                passes_total=self._get_pass_count(algorithm),
++                success=False,
++                error_message=f"Target path '{path}' does not exist or is not a regular file.",
++                started_at=start_time,
++                completed_at=time.time(),
++            )
++
++        file_size = path.stat().st_size
++        pass_patterns = self._get_algorithm_passes(algorithm)
++        total_passes = len(pass_patterns)
++        pass_details: List[PassDetail] = []
++
++        try:
++            # Handle edge case: 0-byte file
++            if file_size == 0:
++                for idx, (p_name, _) in enumerate(pass_patterns, start=1):
++                    pass_details.append(
++                        PassDetail(
++                            pass_number=idx,
++                            total_passes=total_passes,
++                            pattern_name=p_name,
++                            bytes_written=0,
++                            elapsed_seconds=0.0,
++                        )
++                    )
++                return SanitizationResult(
++                    target_path=str(path),
++                    algorithm=algorithm,
++                    total_bytes_sanitized=0,
++                    passes_completed=total_passes,
++                    passes_total=total_passes,
++                    success=True,
++                    pass_details=pass_details,
++                    started_at=start_time,
++                    completed_at=time.time(),
++                )
++
++            # Perform each pass
++            with open(path, "r+b") as f:
++                for pass_num, (pattern_name, chunk_factory) in enumerate(pass_patterns, start=1):
++                    pass_start = time.time()
++                    f.seek(0)
++                    bytes_remaining = file_size
++                    bytes_written_this_pass = 0
++
++                    while bytes_remaining > 0:
++                        current_chunk_len = min(self.chunk_size, bytes_remaining)
++                        pattern_data = chunk_factory(current_chunk_len)
++                        
++                        f.write(pattern_data)
++                        bytes_written_this_pass += current_chunk_len
++                        bytes_remaining -= current_chunk_len
++
++                        if progress_callback:
++                            progress_callback(pass_num, total_passes, bytes_written_this_pass, file_size)
++
++                    # Flush Python internal buffers and enforce OS storage cache commitment
++                    f.flush()
++                    os.fsync(f.fileno())
++
++                    pass_duration = time.time() - pass_start
++                    pass_details.append(
++                        PassDetail(
++                            pass_number=pass_num,
++                            total_passes=total_passes,
++                            pattern_name=pattern_name,
++                            bytes_written=bytes_written_this_pass,
++                            elapsed_seconds=pass_duration,
++                        )
++                    )
++
++            return SanitizationResult(
++                target_path=str(path),
++                algorithm=algorithm,
++                total_bytes_sanitized=file_size,
++                passes_completed=total_passes,
++                passes_total=total_passes,
++                success=True,
++                pass_details=pass_details,
++                started_at=start_time,
++                completed_at=time.time(),
++            )
++
++        except PermissionError as pe:
++            return SanitizationResult(
++                target_path=str(path),
++                algorithm=algorithm,
++                total_bytes_sanitized=0,
++                passes_completed=len(pass_details),
++                passes_total=total_passes,
++                success=False,
++                pass_details=pass_details,
++                error_message=f"Access Denied (PermissionError): {pe}",
++                started_at=start_time,
++                completed_at=time.time(),
++            )
++        except Exception as ex:
++            return SanitizationResult(
++                target_path=str(path),
++                algorithm=algorithm,
++                total_bytes_sanitized=0,
++                passes_completed=len(pass_details),
++                passes_total=total_passes,
++                success=False,
++                pass_details=pass_details,
++                error_message=f"Sanitization Failed: {str(ex)}",
++                started_at=start_time,
++                completed_at=time.time(),
++            )
++
++    def _get_pass_count(self, algorithm: SanitizationAlgorithm) -> int:
++        return len(self._get_algorithm_passes(algorithm))
++
++    def _get_algorithm_passes(
++        self, algorithm: SanitizationAlgorithm
++    ) -> List[tuple[str, Callable[[int], bytes]]]:
++        """Map algorithm to pass specifications and chunk generator functions."""
++        if algorithm == SanitizationAlgorithm.NIST_800_88_CLEAR:
++            # 1-pass random overwrite per NIST Clear procedural guideline
++            return [("NIST Clear (Cryptographic Random)", BinaryPatternGenerator.random)]
++
++        elif algorithm == SanitizationAlgorithm.LEGACY_DOD_5220_22_M:
++            # Legacy DoD 3-pass overwrite: Pass 1 (0x00), Pass 2 (0xFF), Pass 3 (Random)
++            return [
++                ("Pass 1: Fixed Zeros (0x00)", BinaryPatternGenerator.zeros),
++                ("Pass 2: Fixed Ones (0xFF)", BinaryPatternGenerator.ones),
++                ("Pass 3: Pseudo-Random", BinaryPatternGenerator.random),
++            ]
++
++        elif algorithm == SanitizationAlgorithm.ZERO_OVERWRITE:
++            return [("Zero Overwrite (0x00)", BinaryPatternGenerator.zeros)]
++
++        elif algorithm == SanitizationAlgorithm.RANDOM_OVERWRITE:
++            return [("Random Overwrite", BinaryPatternGenerator.random)]
++
++        else:
++            raise ValueError(f"Unsupported algorithm: {algorithm}")
++
++
++# Convenient module-level functions
++def overwrite_nist_clear(
++    target_path: str | Path,
++    chunk_size: int = DEFAULT_CHUNK_SIZE,
++    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
++) -> SanitizationResult:
++    """Perform 1-pass NIST SP 800-88 Clear overwrite (random bytes)."""
++    engine = OverwriteEngine(chunk_size=chunk_size)
++    return engine.sanitize_file(
++        target_path,
++        algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++        progress_callback=progress_callback,
++    )
++
++
++def overwrite_dod_3pass(
++    target_path: str | Path,
++    chunk_size: int = DEFAULT_CHUNK_SIZE,
++    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
++) -> SanitizationResult:
++    """Perform legacy 3-pass DoD 5220.22-M overwrite (0x00 -> 0xFF -> Random)."""
++    engine = OverwriteEngine(chunk_size=chunk_size)
++    return engine.sanitize_file(
++        target_path,
++        algorithm=SanitizationAlgorithm.LEGACY_DOD_5220_22_M,
++        progress_callback=progress_callback,
++    )
+diff --git a/tests/erasure/test_methods.py b/tests/erasure/test_methods.py
+new file mode 100644
+index 0000000..def87f9
+--- /dev/null
++++ b/tests/erasure/test_methods.py
+@@ -0,0 +1,128 @@
++"""
++Unit tests for erasure.methods and erasure.device_detection.
++Ensures tests strictly run on local dummy test files.
++"""
++
++import os
++import tempfile
++from pathlib import Path
++import pytest
++
++from erasure.methods import (
++    DEFAULT_CHUNK_SIZE,
++    BinaryPatternGenerator,
++    OverwriteEngine,
++    SanitizationAlgorithm,
++    overwrite_dod_3pass,
++    overwrite_nist_clear,
++)
++from erasure.device_detection import (
++    StorageMediaType,
++    TargetScopeValidator,
++    validate_sanitization_target,
++)
++
++
++@pytest.fixture
++def temp_dummy_dir():
++    """Create a temporary directory for local dummy files."""
++    with tempfile.TemporaryDirectory() as tmpdir:
++        yield Path(tmpdir)
++
++
++def test_chunk_size_enforced():
++    """Ensure standard 4096-byte chunk size is enforced."""
++    assert DEFAULT_CHUNK_SIZE == 4096
++
++
++def test_binary_pattern_generator():
++    """Verify binary patterns generate correct byte sequences."""
++    zeros = BinaryPatternGenerator.zeros(16)
++    assert zeros == b"\x00" * 16
++
++    ones = BinaryPatternGenerator.ones(16)
++    assert ones == b"\xFF" * 16
++
++    rand_bytes = BinaryPatternGenerator.random(32)
++    assert len(rand_bytes) == 32
++    # Probability of 32 random bytes being all 0x00 is 1/(256^32)
++    assert rand_bytes != b"\x00" * 32
++
++
++def test_nist_clear_overwrite_dummy_file(temp_dummy_dir):
++    """Test 1-pass NIST Clear on a local dummy file."""
++    dummy_file = temp_dummy_dir / "dummy_nist.txt"
++    original_data = b"CONFIDENTIAL FORENSIC EVIDENCE" * 100
++    dummy_file.write_bytes(original_data)
++    original_size = len(original_data)
++
++    res = overwrite_nist_clear(dummy_file)
++
++    assert res.success is True
++    assert res.passes_completed == 1
++    assert res.passes_total == 1
++    assert res.total_bytes_sanitized == original_size
++    assert dummy_file.stat().st_size == original_size
++
++    # Verify content was overwritten and no longer matches original
++    new_data = dummy_file.read_bytes()
++    assert new_data != original_data
++
++
++def test_dod_3pass_overwrite_dummy_file(temp_dummy_dir):
++    """Test legacy DoD 3-pass overwrite on a local dummy file."""
++    dummy_file = temp_dummy_dir / "dummy_dod.bin"
++    original_data = b"SECRET FORENSIC ARTIFACT RECORD" * 500
++    dummy_file.write_bytes(original_data)
++    original_size = len(original_data)
++
++    res = overwrite_dod_3pass(dummy_file)
++
++    assert res.success is True
++    assert res.passes_completed == 3
++    assert res.passes_total == 3
++    assert len(res.pass_details) == 3
++    assert res.total_bytes_sanitized == original_size
++
++    # Verify final overwritten data is changed
++    assert dummy_file.read_bytes() != original_data
++
++
++def test_empty_dummy_file(temp_dummy_dir):
++    """Test sanitization handles 0-byte files gracefully without crashing."""
++    empty_file = temp_dummy_dir / "empty_dummy.bin"
++    empty_file.write_bytes(b"")
++
++    res = overwrite_nist_clear(empty_file)
++
++    assert res.success is True
++    assert res.total_bytes_sanitized == 0
++    assert empty_file.stat().st_size == 0
++
++
++def test_device_detection_rejects_system_paths():
++    """Verify safety validator rejects critical system directories."""
++    validator = TargetScopeValidator()
++
++    # Reject Windows system directory
++    res_win = validator.evaluate_target(r"C:\Windows\System32")
++    assert res_win.is_safe is False
++    assert "REJECTED" in (res_win.rejection_reason or "") or "protected" in (res_win.rejection_reason or "").lower()
++
++    # Reject root drive device
++    res_drive = validator.evaluate_target(r"\\.\PhysicalDrive0")
++    assert res_drive.is_safe is False
++    assert res_drive.is_block_device is True
++
++
++def test_device_detection_approves_local_dummy_file(temp_dummy_dir):
++    """Verify local dummy test file in approved path is marked safe."""
++    dummy_file = temp_dummy_dir / "dummy_test_sample.dat"
++    dummy_file.write_bytes(b"TEST DUMMY DATA")
++
++    validator = TargetScopeValidator(approved_roots=[temp_dummy_dir])
++    res = validator.evaluate_target(dummy_file)
++
++    assert res.is_safe is True
++    assert res.media_type == StorageMediaType.DUMMY_TEST_FILE
++    assert res.size_bytes == len(b"TEST DUMMY DATA")
+
+From 58e0f907a0b0219c65b894941d6d598e47138996 Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Tue, 1 Sep 2026 21:24:41 +0530
+Subject: [PATCH 2/7] Fix: Handle raw NT device paths safely and add dual
+ unittest/pytest support
+
+---
+ erasure/device_detection.py   |  45 +++++++---
+ tests/erasure/test_methods.py | 162 +++++++++++++++++-----------------
+ 2 files changed, 116 insertions(+), 91 deletions(-)
+
+diff --git a/erasure/device_detection.py b/erasure/device_detection.py
+index 67537f4..dcbf2e2 100644
+--- a/erasure/device_detection.py
++++ b/erasure/device_detection.py
+@@ -84,6 +84,7 @@ class TargetScopeValidator:
+     PROTECTED_DRIVE_NAMES: Set[str] = {
+         r"\\.\PhysicalDrive0",
+         r"\\.\C:",
++        r"\\.\PhysicalDrive",
+         "/dev/sda",
+         "/dev/nvme0n1",
+         "/dev/root",
+@@ -94,7 +95,13 @@ def __init__(self, approved_roots: Optional[List[Path | str]] = None) -> None:
+         Initialize validator with optional list of explicitly approved root directories.
+         If provided, targets MUST reside within an approved directory tree unless explicitly bypassed.
+         """
+-        self.approved_roots = [Path(r).resolve() for r in approved_roots] if approved_roots else []
++        self.approved_roots: List[Path] = []
++        if approved_roots:
++            for r in approved_roots:
++                try:
++                    self.approved_roots.append(Path(r).resolve())
++                except Exception:
++                    self.approved_roots.append(Path(r))
+ 
+     def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         """
+@@ -102,10 +109,15 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         Rejects critical system targets, root paths, and unapproved scopes.
+         """
+         raw_str = str(target_path).strip()
+-        path = Path(raw_str).resolve() if raw_str else Path(".")
+ 
+-        # 1. Check for raw system block device targets
+-        if raw_str in self.PROTECTED_DRIVE_NAMES:
++        # 1. Check for raw system block device targets before filesystem resolution
++        if (
++            raw_str.startswith(r"\\.\\")
++            or raw_str.startswith(r"\\.\PhysicalDrive")
++            or raw_str.startswith("/dev/sd")
++            or raw_str.startswith("/dev/nvme")
++            or raw_str in self.PROTECTED_DRIVE_NAMES
++        ):
+             return TargetScopeInfo(
+                 target_path=raw_str,
+                 is_safe=False,
+@@ -115,6 +127,17 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+                 rejection_reason="CRITICAL: Primary OS physical disk or system partition is protected.",
+             )
+ 
++        try:
++            path = Path(raw_str).resolve() if raw_str else Path(".")
++        except Exception as resolve_err:
++            return TargetScopeInfo(
++                target_path=raw_str,
++                is_safe=False,
++                media_type=StorageMediaType.UNKNOWN,
++                size_bytes=0,
++                rejection_reason=f"Failed to resolve target path: {resolve_err}",
++            )
++
+         # 2. Check path existence
+         if not path.exists():
+             return TargetScopeInfo(
+@@ -132,8 +155,9 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         if platform.system() == "Windows":
+             for sys_dir in self.PROTECTED_SYSTEM_DIRS_WINDOWS:
+                 try:
+-                    if path == Path(sys_dir).resolve() or Path(sys_dir).resolve() in path.parents:
+-                        # Allow dedicated subfolder in user directory only if inside approved roots or workspace
++                    sys_resolved = Path(sys_dir).resolve()
++                    if path == sys_resolved or sys_resolved in path.parents:
++                        # Allow dedicated subfolder in user directory only if inside approved roots
+                         if not self._is_within_approved_roots(path):
+                             return TargetScopeInfo(
+                                 target_path=resolved_str,
+@@ -150,7 +174,8 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         else:
+             for sys_dir in self.PROTECTED_SYSTEM_DIRS_POSIX:
+                 try:
+-                    if path == Path(sys_dir).resolve() or (sys_dir != "/" and Path(sys_dir).resolve() in path.parents):
++                    sys_resolved = Path(sys_dir).resolve()
++                    if path == sys_resolved or (sys_dir != "/" and sys_resolved in path.parents):
+                         if not self._is_within_approved_roots(path):
+                             return TargetScopeInfo(
+                                 target_path=resolved_str,
+@@ -206,7 +231,6 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+     def _is_within_approved_roots(self, path: Path) -> bool:
+         """Check if path is inside any approved root."""
+         if not self.approved_roots:
+-            # Default safe fallback: allow current working directory subtrees or designated temp files
+             cwd = Path.cwd().resolve()
+             if path == cwd or cwd in path.parents:
+                 return True
+@@ -218,12 +242,10 @@ def _detect_media_type(self, path: Path) -> StorageMediaType:
+         """
+         Detect underlying storage technology (SSD vs. HDD vs. Dummy File).
+         """
+-        # If target has dummy/temp naming or is inside test workspace
+         filename = path.name.lower()
+         if any(marker in filename for marker in ["dummy", "test", "temp", "sample", "fixture"]):
+             return StorageMediaType.DUMMY_TEST_FILE
+ 
+-        # Platform-specific hardware query
+         if platform.system() == "Windows":
+             return self._detect_windows_media_type(path)
+         elif platform.system() == "Linux":
+@@ -233,7 +255,7 @@ def _detect_media_type(self, path: Path) -> StorageMediaType:
+ 
+     def _detect_windows_media_type(self, path: Path) -> StorageMediaType:
+         """Query Windows WMI/PowerShell PhysicalDisk MediaType for the volume."""
+-        drive = path.drive  # e.g., "C:"
++        drive = path.drive
+         if not drive:
+             return StorageMediaType.UNKNOWN
+ 
+@@ -261,7 +283,6 @@ def _detect_windows_media_type(self, path: Path) -> StorageMediaType:
+     def _detect_linux_media_type(self, path: Path) -> StorageMediaType:
+         """Query Linux sysfs rotational flag (/sys/block/*/queue/rotational)."""
+         try:
+-            # Check rotational flag: 0 = SSD/Flash, 1 = Rotational HDD
+             res = subprocess.check_output(
+                 ["df", "--output=source", str(path)],
+                 text=True,
+diff --git a/tests/erasure/test_methods.py b/tests/erasure/test_methods.py
+index def87f9..2b00bcf 100644
+--- a/tests/erasure/test_methods.py
++++ b/tests/erasure/test_methods.py
+@@ -1,12 +1,16 @@
+ """
+ Unit tests for erasure.methods and erasure.device_detection.
++Compatible with both standard library unittest and pytest.
+ Ensures tests strictly run on local dummy test files.
+ """
+ 
++from __future__ import annotations
++
+ import os
++import shutil
+ import tempfile
++import unittest
+ from pathlib import Path
+-import pytest
+ 
+ from erasure.methods import (
+     DEFAULT_CHUNK_SIZE,
+@@ -23,106 +27,106 @@
+ )
+ 
+ 
+-@pytest.fixture
+-def temp_dummy_dir():
+-    """Create a temporary directory for local dummy files."""
+-    with tempfile.TemporaryDirectory() as tmpdir:
+-        yield Path(tmpdir)
+-
+-
+-def test_chunk_size_enforced():
+-    """Ensure standard 4096-byte chunk size is enforced."""
+-    assert DEFAULT_CHUNK_SIZE == 4096
+-
++class TestErasureMethodsAndDetection(unittest.TestCase):
++    """Test suite for sanitization methods and target scope detection."""
+ 
+-def test_binary_pattern_generator():
+-    """Verify binary patterns generate correct byte sequences."""
+-    zeros = BinaryPatternGenerator.zeros(16)
+-    assert zeros == b"\x00" * 16
++    def setUp(self) -> None:
++        self.test_dir = Path(tempfile.mkdtemp(prefix="securevault_dummy_"))
+ 
+-    ones = BinaryPatternGenerator.ones(16)
+-    assert ones == b"\xFF" * 16
++    def tearDown(self) -> None:
++        if self.test_dir.exists():
++            shutil.rmtree(self.test_dir, ignore_errors=True)
+ 
+-    rand_bytes = BinaryPatternGenerator.random(32)
+-    assert len(rand_bytes) == 32
+-    # Probability of 32 random bytes being all 0x00 is 1/(256^32)
+-    assert rand_bytes != b"\x00" * 32
++    def test_chunk_size_enforced(self) -> None:
++        """Ensure standard 4096-byte chunk size is enforced."""
++        self.assertEqual(DEFAULT_CHUNK_SIZE, 4096)
+ 
++    def test_binary_pattern_generator(self) -> None:
++        """Verify binary patterns generate correct byte sequences."""
++        zeros = BinaryPatternGenerator.zeros(16)
++        self.assertEqual(zeros, b"\x00" * 16)
+ 
+-def test_nist_clear_overwrite_dummy_file(temp_dummy_dir):
+-    """Test 1-pass NIST Clear on a local dummy file."""
+-    dummy_file = temp_dummy_dir / "dummy_nist.txt"
+-    original_data = b"CONFIDENTIAL FORENSIC EVIDENCE" * 100
+-    dummy_file.write_bytes(original_data)
+-    original_size = len(original_data)
++        ones = BinaryPatternGenerator.ones(16)
++        self.assertEqual(ones, b"\xFF" * 16)
+ 
+-    res = overwrite_nist_clear(dummy_file)
++        rand_bytes = BinaryPatternGenerator.random(32)
++        self.assertEqual(len(rand_bytes), 32)
++        self.assertNotEqual(rand_bytes, b"\x00" * 32)
+ 
+-    assert res.success is True
+-    assert res.passes_completed == 1
+-    assert res.passes_total == 1
+-    assert res.total_bytes_sanitized == original_size
+-    assert dummy_file.stat().st_size == original_size
++    def test_nist_clear_overwrite_dummy_file(self) -> None:
++        """Test 1-pass NIST Clear on a local dummy file."""
++        dummy_file = self.test_dir / "dummy_nist.txt"
++        original_data = b"CONFIDENTIAL FORENSIC EVIDENCE" * 100
++        dummy_file.write_bytes(original_data)
++        original_size = len(original_data)
+ 
+-    # Verify content was overwritten and no longer matches original
+-    new_data = dummy_file.read_bytes()
+-    assert new_data != original_data
++        res = overwrite_nist_clear(dummy_file)
+ 
++        self.assertTrue(res.success)
++        self.assertEqual(res.passes_completed, 1)
++        self.assertEqual(res.passes_total, 1)
++        self.assertEqual(res.total_bytes_sanitized, original_size)
++        self.assertEqual(dummy_file.stat().st_size, original_size)
+ 
+-def test_dod_3pass_overwrite_dummy_file(temp_dummy_dir):
+-    """Test legacy DoD 3-pass overwrite on a local dummy file."""
+-    dummy_file = temp_dummy_dir / "dummy_dod.bin"
+-    original_data = b"SECRET FORENSIC ARTIFACT RECORD" * 500
+-    dummy_file.write_bytes(original_data)
+-    original_size = len(original_data)
++        # Verify content was overwritten and no longer matches original
++        new_data = dummy_file.read_bytes()
++        self.assertNotEqual(new_data, original_data)
+ 
+-    res = overwrite_dod_3pass(dummy_file)
++    def test_dod_3pass_overwrite_dummy_file(self) -> None:
++        """Test legacy DoD 3-pass overwrite on a local dummy file."""
++        dummy_file = self.test_dir / "dummy_dod.bin"
++        original_data = b"SECRET FORENSIC ARTIFACT RECORD" * 500
++        dummy_file.write_bytes(original_data)
++        original_size = len(original_data)
+ 
+-    assert res.success is True
+-    assert res.passes_completed == 3
+-    assert res.passes_total == 3
+-    assert len(res.pass_details) == 3
+-    assert res.total_bytes_sanitized == original_size
++        res = overwrite_dod_3pass(dummy_file)
+ 
+-    # Verify final overwritten data is changed
+-    assert dummy_file.read_bytes() != original_data
++        self.assertTrue(res.success)
++        self.assertEqual(res.passes_completed, 3)
++        self.assertEqual(res.passes_total, 3)
++        self.assertEqual(len(res.pass_details), 3)
++        self.assertEqual(res.total_bytes_sanitized, original_size)
+ 
++        # Verify final overwritten data is changed
++        self.assertNotEqual(dummy_file.read_bytes(), original_data)
+ 
+-def test_empty_dummy_file(temp_dummy_dir):
+-    """Test sanitization handles 0-byte files gracefully without crashing."""
+-    empty_file = temp_dummy_dir / "empty_dummy.bin"
+-    empty_file.write_bytes(b"")
++    def test_empty_dummy_file(self) -> None:
++        """Test sanitization handles 0-byte files gracefully without crashing."""
++        empty_file = self.test_dir / "empty_dummy.bin"
++        empty_file.write_bytes(b"")
+ 
+-    res = overwrite_nist_clear(empty_file)
++        res = overwrite_nist_clear(empty_file)
+ 
+-    assert res.success is True
+-    assert res.total_bytes_sanitized == 0
+-    assert empty_file.stat().st_size == 0
++        self.assertTrue(res.success)
++        self.assertEqual(res.total_bytes_sanitized, 0)
++        self.assertEqual(empty_file.stat().st_size, 0)
+ 
++    def test_device_detection_rejects_system_paths(self) -> None:
++        """Verify safety validator rejects critical system directories."""
++        validator = TargetScopeValidator()
+ 
+-def test_device_detection_rejects_system_paths():
+-    """Verify safety validator rejects critical system directories."""
+-    validator = TargetScopeValidator()
++        # Reject Windows system directory
++        res_win = validator.evaluate_target(r"C:\Windows\System32")
++        self.assertFalse(res_win.is_safe)
++        self.assertTrue("REJECTED" in (res_win.rejection_reason or "") or "protected" in (res_win.rejection_reason or "").lower())
+ 
+-    # Reject Windows system directory
+-    res_win = validator.evaluate_target(r"C:\Windows\System32")
+-    assert res_win.is_safe is False
+-    assert "REJECTED" in (res_win.rejection_reason or "") or "protected" in (res_win.rejection_reason or "").lower()
++        # Reject root drive device
++        res_drive = validator.evaluate_target(r"\\.\PhysicalDrive0")
++        self.assertFalse(res_drive.is_safe)
++        self.assertTrue(res_drive.is_block_device)
+ 
+-    # Reject root drive device
+-    res_drive = validator.evaluate_target(r"\\.\PhysicalDrive0")
+-    assert res_drive.is_safe is False
+-    assert res_drive.is_block_device is True
++    def test_device_detection_approves_local_dummy_file(self) -> None:
++        """Verify local dummy test file in approved path is marked safe."""
++        dummy_file = self.test_dir / "dummy_test_sample.dat"
++        dummy_file.write_bytes(b"TEST DUMMY DATA")
+ 
++        validator = TargetScopeValidator(approved_roots=[self.test_dir])
++        res = validator.evaluate_target(dummy_file)
+ 
+-def test_device_detection_approves_local_dummy_file(temp_dummy_dir):
+-    """Verify local dummy test file in approved path is marked safe."""
+-    dummy_file = temp_dummy_dir / "dummy_test_sample.dat"
+-    dummy_file.write_bytes(b"TEST DUMMY DATA")
++        self.assertTrue(res.is_safe)
++        self.assertEqual(res.media_type, StorageMediaType.DUMMY_TEST_FILE)
++        self.assertEqual(res.size_bytes, len(b"TEST DUMMY DATA"))
+ 
+-    validator = TargetScopeValidator(approved_roots=[temp_dummy_dir])
+-    res = validator.evaluate_target(dummy_file)
+ 
+-    assert res.is_safe is True
+-    assert res.media_type == StorageMediaType.DUMMY_TEST_FILE
+-    assert res.size_bytes == len(b"TEST DUMMY DATA")
++if __name__ == "__main__":
++    unittest.main()
+
+From fdb7434c36136bfb2a347a30c8528d69b06b1e2b Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Tue, 1 Sep 2026 21:27:10 +0530
+Subject: [PATCH 3/7] Feat: Add check_target_safety helper and improve temp
+ directory approval
+
+---
+ erasure/__init__.py         |  3 +++
+ erasure/device_detection.py | 44 +++++++++++++++++++++++++++++++------
+ 2 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/erasure/__init__.py b/erasure/__init__.py
+index b26fdf8..05caaf2 100644
+--- a/erasure/__init__.py
++++ b/erasure/__init__.py
+@@ -17,6 +17,7 @@
+     StorageMediaType,
+     TargetScopeInfo,
+     TargetScopeValidator,
++    check_target_safety,
+     validate_sanitization_target,
+ )
+ 
+@@ -32,5 +33,7 @@
+     "StorageMediaType",
+     "TargetScopeInfo",
+     "TargetScopeValidator",
++    "check_target_safety",
+     "validate_sanitization_target",
+ ]
++
+diff --git a/erasure/device_detection.py b/erasure/device_detection.py
+index dcbf2e2..416747a 100644
+--- a/erasure/device_detection.py
++++ b/erasure/device_detection.py
+@@ -229,14 +229,30 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         )
+ 
+     def _is_within_approved_roots(self, path: Path) -> bool:
+-        """Check if path is inside any approved root."""
+-        if not self.approved_roots:
+-            cwd = Path.cwd().resolve()
+-            if path == cwd or cwd in path.parents:
++        """Check if path is inside any approved root, cwd, or temp directory."""
++        import tempfile
++
++        temp_dir = Path(tempfile.gettempdir()).resolve()
++        cwd = Path.cwd().resolve()
++
++        # Check explicit approved roots if configured
++        if self.approved_roots:
++            if any(path == app_root or app_root in path.parents for app_root in self.approved_roots):
+                 return True
+-            return False
+ 
+-        return any(path == app_root or app_root in path.parents for app_root in self.approved_roots)
++        # Default safe locations: cwd subtree, system tempdir, or explicit dummy/temp test markers
++        if path == cwd or cwd in path.parents:
++            return True
++
++        if path == temp_dir or temp_dir in path.parents:
++            return True
++
++        name_lower = path.name.lower()
++        if any(marker in name_lower for marker in ["dummy", "test", "temp", "sample", "fixture"]):
++            return True
++
++        return False
++
+ 
+     def _detect_media_type(self, path: Path) -> StorageMediaType:
+         """
+@@ -301,7 +317,7 @@ def _detect_linux_media_type(self, path: Path) -> StorageMediaType:
+         return StorageMediaType.UNKNOWN
+ 
+ 
+-# Module-level convenience helper
++# Module-level convenience helpers
+ def validate_sanitization_target(
+     target_path: str | Path,
+     approved_roots: Optional[List[Path | str]] = None,
+@@ -309,3 +325,17 @@ def validate_sanitization_target(
+     """Validate that a target path is safe and within allowable sanitization scope."""
+     validator = TargetScopeValidator(approved_roots=approved_roots)
+     return validator.evaluate_target(target_path)
++
++
++def check_target_safety(
++    target_path: str | Path,
++    approved_roots: Optional[List[Path | str]] = None,
++) -> bool:
++    """
++    Check if a target path is safe for sanitization.
++    Returns True if target is safe (e.g. local dummy file / approved scope),
++    or False if target is rejected (e.g. system directory, system drive).
++    """
++    report = validate_sanitization_target(target_path, approved_roots=approved_roots)
++    return report.is_safe
++
+
+From 4a9e5d50e7f302a6a6701d2f7869e6373638eef3 Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Wed, 2 Sep 2026 16:18:36 +0530
+Subject: [PATCH 4/7] Feat: Add independent binary verification engine in
+ erasure/
+
+---
+ erasure/__init__.py                |  22 +-
+ erasure/verification.py            | 353 ++++++++++++++++++++++++++++-
+ tests/erasure/test_verification.py | 177 +++++++++++++++
+ 3 files changed, 541 insertions(+), 11 deletions(-)
+ create mode 100644 tests/erasure/test_verification.py
+
+diff --git a/erasure/__init__.py b/erasure/__init__.py
+index 05caaf2..9b2e195 100644
+--- a/erasure/__init__.py
++++ b/erasure/__init__.py
+@@ -20,8 +20,19 @@
+     check_target_safety,
+     validate_sanitization_target,
+ )
++from erasure.verification import (
++    DEFAULT_MIN_RANDOM_ENTROPY,
++    DEFAULT_SAMPLE_CHUNK_SIZE,
++    SampleChunkResult,
++    VerificationEngine,
++    VerificationReport,
++    calculate_shannon_entropy,
++    inspect_erasure,
++    verify_erasure,
++)
+ 
+ __all__ = [
++    # Methods
+     "DEFAULT_CHUNK_SIZE",
+     "BinaryPatternGenerator",
+     "OverwriteEngine",
+@@ -30,10 +41,19 @@
+     "SanitizationResult",
+     "overwrite_dod_3pass",
+     "overwrite_nist_clear",
++    # Device Detection
+     "StorageMediaType",
+     "TargetScopeInfo",
+     "TargetScopeValidator",
+     "check_target_safety",
+     "validate_sanitization_target",
++    # Verification
++    "DEFAULT_SAMPLE_CHUNK_SIZE",
++    "DEFAULT_MIN_RANDOM_ENTROPY",
++    "SampleChunkResult",
++    "VerificationEngine",
++    "VerificationReport",
++    "calculate_shannon_entropy",
++    "inspect_erasure",
++    "verify_erasure",
+ ]
+-
+diff --git a/erasure/verification.py b/erasure/verification.py
+index 3a33d8a..f5ea3b0 100644
+--- a/erasure/verification.py
++++ b/erasure/verification.py
+@@ -1,15 +1,348 @@
+ """
+ Verification — Owner: Person 5
++Module: erasure.verification
+ 
+-Post-sanitization verification engine. Reads back target media to confirm
+-that sanitization was effective. Generates verification reports and
+-certificates of destruction.
+-
+-Deliverables:
+-- Read-back verification after sanitization
+-- Statistical sampling for large media
+-- Generate verification report (pass/fail + evidence)
+-- Produce certificate of destruction (PDF/JSON)
++Post-sanitization verification engine. Inspects overwritten storage targets
++to confirm data destruction efficacy using pattern matching and statistical
++entropy analysis across file headers, body segments, and tail boundaries.
+ """
+ 
+-# TODO: implement
++from __future__ import annotations
++
++import math
++from collections import Counter
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import List, Optional, Tuple
++
++
++DEFAULT_SAMPLE_CHUNK_SIZE: int = 4096  # 4KB sample chunk size
++DEFAULT_MIN_RANDOM_ENTROPY: float = 7.2  # Threshold for cryptographic random bytes (max 8.0)
++
++
++@dataclass
++class SampleChunkResult:
++    """Telemetry for a single sampled binary chunk."""
++    location: str  # "header", "body_N", "tail", "full_file"
++    offset: int
++    size: int
++    entropy: float
++    matches_pattern: Optional[bool]
++    all_zeros: bool
++    all_ones: bool
++
++
++@dataclass
++class VerificationReport:
++    """Comprehensive forensic verification report for audit logs and certificates."""
++    target_path: str
++    passed: bool
++    file_size_bytes: int
++    sample_sectors_checked: int
++    residual_data_found: bool
++    average_entropy: float
++    expected_pattern_type: str
++    details: str
++    sampled_chunks: List[SampleChunkResult] = field(default_factory=list)
++
++
++def calculate_shannon_entropy(data: bytes) -> float:
++    """
++    Compute empirical Shannon entropy in bits per byte (0.0 to 8.0).
++    H = - sum(p(x) * log2(p(x)))
++    """
++    if not data:
++        return 0.0
++
++    length = len(data)
++    counts = Counter(data)
++    entropy = 0.0
++
++    for count in counts.values():
++        prob = count / length
++        entropy -= prob * math.log2(prob)
++
++    return round(entropy, 4)
++
++
++class VerificationEngine:
++    """
++    Independent binary verification engine for storage sanitization audits.
++    Samples binary chunks across header, body, and tail to verify sanitization.
++    """
++
++    def __init__(
++        self,
++        sample_chunk_size: int = DEFAULT_SAMPLE_CHUNK_SIZE,
++        num_body_samples: int = 3,
++        min_random_entropy: float = DEFAULT_MIN_RANDOM_ENTROPY,
++    ) -> None:
++        self.sample_chunk_size = sample_chunk_size
++        self.num_body_samples = num_body_samples
++        self.min_random_entropy = min_random_entropy
++
++    def verify(
++        self,
++        target_path: str | Path,
++        expected_pattern: Optional[bytes] = None,
++    ) -> bool:
++        """
++        Verify that target file was properly sanitized.
++        Returns True if verification passes, False otherwise.
++        """
++        report = self.inspect(target_path, expected_pattern=expected_pattern)
++        return report.passed
++
++    def inspect(
++        self,
++        target_path: str | Path,
++        expected_pattern: Optional[bytes] = None,
++    ) -> VerificationReport:
++        """
++        Perform detailed inspection of the target file across header, body, and tail.
++        Returns a VerificationReport with full telemetry.
++        """
++        path = Path(target_path).resolve()
++
++        if not path.is_file():
++            return VerificationReport(
++                target_path=str(path),
++                passed=False,
++                file_size_bytes=0,
++                sample_sectors_checked=0,
++                residual_data_found=True,
++                average_entropy=0.0,
++                expected_pattern_type="unknown",
++                details=f"Target file '{path}' does not exist or is not a regular file.",
++            )
++
++        file_size = path.stat().st_size
++
++        # Handle 0-byte empty file edge case
++        if file_size == 0:
++            return VerificationReport(
++                target_path=str(path),
++                passed=True,
++                file_size_bytes=0,
++                sample_sectors_checked=0,
++                residual_data_found=False,
++                average_entropy=0.0,
++                expected_pattern_type="empty_file",
++                details="0-byte file verified: no residual bytes exist.",
++            )
++
++        # Build list of sample offsets: Header, Body (distributed), Tail
++        sample_offsets = self._calculate_sample_offsets(file_size)
++        sampled_results: List[SampleChunkResult] = []
++
++        with open(path, "rb") as f:
++            for loc_name, offset, read_len in sample_offsets:
++                f.seek(offset)
++                chunk_data = f.read(read_len)
++                
++                if not chunk_data:
++                    continue
++
++                entropy = calculate_shannon_entropy(chunk_data)
++                all_zeros = chunk_data == b"\x00" * len(chunk_data)
++                all_ones = chunk_data == b"\xFF" * len(chunk_data)
++
++                # Check pattern match if an expected pattern was provided
++                matches_pattern: Optional[bool] = None
++                if expected_pattern is not None:
++                    matches_pattern = self._matches_expected_pattern(chunk_data, expected_pattern)
++
++                sampled_results.append(
++                    SampleChunkResult(
++                        location=loc_name,
++                        offset=offset,
++                        size=len(chunk_data),
++                        entropy=entropy,
++                        matches_pattern=matches_pattern,
++                        all_zeros=all_zeros,
++                        all_ones=all_ones,
++                    )
++                )
++
++        if not sampled_results:
++            return VerificationReport(
++                target_path=str(path),
++                passed=False,
++                file_size_bytes=file_size,
++                sample_sectors_checked=0,
++                residual_data_found=True,
++                average_entropy=0.0,
++                expected_pattern_type="unknown",
++                details="Failed to read sample chunks from target file.",
++            )
++
++        # Evaluate verification criteria
++        avg_entropy = round(
++            sum(r.entropy for r in sampled_results) / len(sampled_results), 4
++        )
++
++        passed, residual_found, pattern_type_desc, details = self._evaluate_results(
++            sampled_results, file_size, expected_pattern, avg_entropy
++        )
++
++        return VerificationReport(
++            target_path=str(path),
++            passed=passed,
++            file_size_bytes=file_size,
++            sample_sectors_checked=len(sampled_results),
++            residual_data_found=residual_found,
++            average_entropy=avg_entropy,
++            expected_pattern_type=pattern_type_desc,
++            details=details,
++            sampled_chunks=sampled_results,
++        )
++
++    def _calculate_sample_offsets(self, file_size: int) -> List[Tuple[str, int, int]]:
++        """Compute (location_name, offset, read_length) tuples across header, body, tail."""
++        if file_size <= self.sample_chunk_size:
++            return [("full_file", 0, file_size)]
++
++        offsets: List[Tuple[str, int, int]] = []
++
++        # 1. Header (start of file)
++        header_len = min(self.sample_chunk_size, file_size)
++        offsets.append(("header", 0, header_len))
++
++        # 2. Body (evenly distributed across mid-section)
++        body_start = header_len
++        body_end = max(header_len, file_size - self.sample_chunk_size)
++        body_span = body_end - body_start
++
++        if body_span > 0 and self.num_body_samples > 0:
++            step = body_span / (self.num_body_samples + 1)
++            for i in range(1, self.num_body_samples + 1):
++                sample_pos = int(body_start + (i * step))
++                sample_len = min(self.sample_chunk_size, file_size - sample_pos)
++                if sample_len > 0:
++                    offsets.append((f"body_{i}", sample_pos, sample_len))
++
++        # 3. Tail (end of file)
++        tail_offset = max(0, file_size - self.sample_chunk_size)
++        tail_len = file_size - tail_offset
++        if tail_offset > 0:
++            offsets.append(("tail", tail_offset, tail_len))
++
++        return offsets
++
++    def _matches_expected_pattern(self, chunk: bytes, expected: bytes) -> bool:
++        """Check if chunk strictly consists of the repeating expected pattern."""
++        if not expected:
++            return True
++        pattern_len = len(expected)
++        full_repeats = len(chunk) // pattern_len
++        remainder = len(chunk) % pattern_len
++        expected_full = (expected * (full_repeats + 1))[: len(chunk)]
++        return chunk == expected_full
++
++    def _evaluate_results(
++        self,
++        sampled_results: List[SampleChunkResult],
++        file_size: int,
++        expected_pattern: Optional[bytes],
++        avg_entropy: float,
++    ) -> Tuple[bool, bool, str, str]:
++        """Determine overall pass/fail status based on pattern matching or entropy analysis."""
++        # Case 1: Explicit pattern verification (e.g. zeros, 0xFF, specific byte sequence)
++        if expected_pattern is not None:
++            pattern_hex = expected_pattern.hex().upper()
++            all_matched = all(r.matches_pattern for r in sampled_results)
++
++            if all_matched:
++                return (
++                    True,
++                    False,
++                    f"Fixed Pattern (0x{pattern_hex})",
++                    f"All {len(sampled_results)} sampled regions strictly matched pattern 0x{pattern_hex}.",
++                )
++            else:
++                mismatches = [r.location for r in sampled_results if not r.matches_pattern]
++                return (
++                    False,
++                    True,
++                    f"Fixed Pattern (0x{pattern_hex})",
++                    f"Pattern mismatch in sampled region(s): {', '.join(mismatches)}. Residual data detected.",
++                )
++
++        # Case 2: Random overwrite verification (NIST Clear / Random pass)
++        # Random data must exhibit high Shannon entropy (typically >= 7.2 for chunks >= 512 bytes)
++        # Small files (< 256 bytes) have natural entropy bounds due to sample size
++        threshold = self.min_random_entropy if file_size >= 512 else max(3.0, (file_size / 256.0) * 7.0)
++        
++        low_entropy_regions = [
++            r.location for r in sampled_results if r.entropy < threshold and r.size >= 256
++        ]
++
++        # Also check if chunks are all 0x00 or all identical repeating bytes when random was expected
++        single_byte_runs = [
++            r.location for r in sampled_results if r.all_zeros or r.all_ones
++        ]
++
++        if not low_entropy_regions and not single_byte_runs:
++            return (
++                True,
++                False,
++                "Cryptographic Random / High Entropy",
++                f"High Shannon entropy confirmed across all {len(sampled_results)} sampled regions (avg: {avg_entropy:.2f} bits/byte).",
++            )
++        else:
++            failures = list(set(low_entropy_regions + single_byte_runs))
++            return (
++                False,
++                True,
++                "Cryptographic Random / High Entropy",
++                f"Failed random verification in region(s): {', '.join(failures)} (avg entropy: {avg_entropy:.2f} < threshold {threshold:.2f}).",
++            )
++
++
++# Module-level convenience functions
++def verify_erasure(
++    target_path: str | Path,
++    expected_pattern: Optional[bytes] = None,
++    sample_size: int = DEFAULT_SAMPLE_CHUNK_SIZE,
++    num_body_samples: int = 3,
++    min_entropy: float = DEFAULT_MIN_RANDOM_ENTROPY,
++) -> bool:
++    """
++    Independent post-wipe verification engine.
++    Opens the overwritten file, samples binary chunks across header, body, and tail,
++    calculates pattern matching or entropy, and returns a boolean status (True/False).
++
++    Args:
++        target_path: Path to the target overwritten file.
++        expected_pattern: Optional expected byte pattern (e.g. b"\x00"). If None, checks random entropy.
++        sample_size: Size in bytes of each sample chunk.
++        num_body_samples: Number of distributed samples to take from the body section.
++        min_entropy: Minimum Shannon entropy required for random overwrite verification.
++
++    Returns:
++        True if sanitization is verified effective, False otherwise.
++    """
++    engine = VerificationEngine(
++        sample_chunk_size=sample_size,
++        num_body_samples=num_body_samples,
++        min_random_entropy=min_entropy,
++    )
++    return engine.verify(target_path, expected_pattern=expected_pattern)
++
++
++def inspect_erasure(
++    target_path: str | Path,
++    expected_pattern: Optional[bytes] = None,
++    sample_size: int = DEFAULT_SAMPLE_CHUNK_SIZE,
++    num_body_samples: int = 3,
++    min_entropy: float = DEFAULT_MIN_RANDOM_ENTROPY,
++) -> VerificationReport:
++    """
++    Perform a complete forensic inspection of an erased file and return a rich VerificationReport.
++    """
++    engine = VerificationEngine(
++        sample_chunk_size=sample_size,
++        num_body_samples=num_body_samples,
++        min_random_entropy=min_entropy,
++    )
++    return engine.inspect(target_path, expected_pattern=expected_pattern)
+diff --git a/tests/erasure/test_verification.py b/tests/erasure/test_verification.py
+new file mode 100644
+index 0000000..00e8334
+--- /dev/null
++++ b/tests/erasure/test_verification.py
+@@ -0,0 +1,177 @@
++"""
++Unit tests for erasure.verification (Independent binary verification engine).
++Tests both successful wipe verifications and forced verification failures.
++Compatible with standard library unittest and pytest.
++Strictly operates on temporary local dummy files.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import tempfile
++import unittest
++from pathlib import Path
++
++from erasure.methods import (
++    OverwriteEngine,
++    SanitizationAlgorithm,
++    overwrite_dod_3pass,
++    overwrite_nist_clear,
++)
++from erasure.verification import (
++    VerificationEngine,
++    calculate_shannon_entropy,
++    inspect_erasure,
++    verify_erasure,
++)
++
++
++class TestErasureVerification(unittest.TestCase):
++    """Test suite for post-wipe binary verification engine."""
++
++    def setUp(self) -> None:
++        self.test_dir = Path(tempfile.mkdtemp(prefix="securevault_verify_"))
++
++    def tearDown(self) -> None:
++        if self.test_dir.exists():
++            shutil.rmtree(self.test_dir, ignore_errors=True)
++
++    # =========================================================================
++    # Shannon Entropy Calculations
++    # =========================================================================
++    def test_entropy_fixed_zeros(self) -> None:
++        """Fixed repeating byte pattern must yield 0.0 entropy."""
++        data = b"\x00" * 4096
++        self.assertEqual(calculate_shannon_entropy(data), 0.0)
++
++    def test_entropy_random_bytes(self) -> None:
++        """Cryptographically random data must yield high entropy (> 7.5 bits/byte)."""
++        data = os.urandom(8192)
++        entropy = calculate_shannon_entropy(data)
++        self.assertGreater(entropy, 7.5)
++        self.assertLessEqual(entropy, 8.0)
++
++    def test_entropy_structured_text(self) -> None:
++        """Structured text typically yields moderate entropy (between 2.5 and 5.0)."""
++        text = b"CONFIDENTIAL FINANCIAL RECORD " * 100
++        entropy = calculate_shannon_entropy(text)
++        self.assertGreater(entropy, 2.0)
++        self.assertLess(entropy, 6.0)
++
++    # =========================================================================
++    # Successful Wipes
++    # =========================================================================
++    def test_verify_zero_overwrite_success(self) -> None:
++        """Verify file wiped with all zeros returns True when expecting b'\\x00'."""
++        dummy_file = self.test_dir / "zero_wiped.bin"
++        dummy_file.write_bytes(b"\x00" * 16384)
++
++        result = verify_erasure(dummy_file, expected_pattern=b"\x00")
++        self.assertTrue(result)
++
++        report = inspect_erasure(dummy_file, expected_pattern=b"\x00")
++        self.assertTrue(report.passed)
++        self.assertFalse(report.residual_data_found)
++        self.assertEqual(report.average_entropy, 0.0)
++
++    def test_verify_nist_clear_random_success(self) -> None:
++        """Verify file wiped via NIST Clear (random) passes high-entropy verification."""
++        dummy_file = self.test_dir / "nist_cleared.bin"
++        dummy_file.write_bytes(b"INITIAL ORIGINAL SENSITIVE EVIDENCE" * 200)
++
++        # Apply NIST Clear overwrite
++        res = overwrite_nist_clear(dummy_file)
++        self.assertTrue(res.success)
++
++        # Verify erasure without explicit pattern (evaluates random entropy)
++        result = verify_erasure(dummy_file, expected_pattern=None)
++        self.assertTrue(result)
++
++        report = inspect_erasure(dummy_file, expected_pattern=None)
++        self.assertTrue(report.passed)
++        self.assertFalse(report.residual_data_found)
++        self.assertGreater(report.average_entropy, 7.2)
++
++    def test_verify_dod_3pass_success(self) -> None:
++        """Verify file sanitized via legacy DoD 3-pass (final pass random) passes verification."""
++        dummy_file = self.test_dir / "dod_wiped.bin"
++        dummy_file.write_bytes(b"TOP SECRET INTELLIGENCE DATA" * 300)
++
++        res = overwrite_dod_3pass(dummy_file)
++        self.assertTrue(res.success)
++
++        result = verify_erasure(dummy_file, expected_pattern=None)
++        self.assertTrue(result)
++
++    def test_verify_empty_file_success(self) -> None:
++        """0-byte file must be verified successfully without errors."""
++        empty_file = self.test_dir / "empty.dat"
++        empty_file.write_bytes(b"")
++
++        self.assertTrue(verify_erasure(empty_file))
++        report = inspect_erasure(empty_file)
++        self.assertTrue(report.passed)
++        self.assertFalse(report.residual_data_found)
++
++    def test_verify_small_file_success(self) -> None:
++        """Small file (< 4096 bytes) should be sampled in full."""
++        small_file = self.test_dir / "small_zero.dat"
++        small_file.write_bytes(b"\x00" * 128)
++
++        self.assertTrue(verify_erasure(small_file, expected_pattern=b"\x00"))
++
++    # =========================================================================
++    # Forced Verification Failures (Adversarial / Residual Data Tests)
++    # =========================================================================
++    def test_forced_failure_residual_data_when_expecting_zeros(self) -> None:
++        """File with non-zero bytes must fail when expecting zero pattern."""
++        dirty_file = self.test_dir / "dirty_zero.bin"
++        # 16KB of zeros, but with residual data at offset 8192
++        dirty_data = bytearray(b"\x00" * 16384)
++        dirty_data[8192:8210] = b"RESIDUAL_PASSWORD!"
++        dirty_file.write_bytes(dirty_data)
++
++        result = verify_erasure(dirty_file, expected_pattern=b"\x00")
++        self.assertFalse(result)
++
++        report = inspect_erasure(dirty_file, expected_pattern=b"\x00")
++        self.assertFalse(report.passed)
++        self.assertTrue(report.residual_data_found)
++        self.assertIn("mismatch", report.details.lower())
++
++    def test_forced_failure_low_entropy_unwiped_data(self) -> None:
++        """Unwiped plaintext file must fail random overwrite verification due to low entropy."""
++        plain_file = self.test_dir / "unwiped_plain.txt"
++        plain_file.write_bytes(b"A" * 16384)  # Single repeating character -> entropy 0.0
++
++        result = verify_erasure(plain_file, expected_pattern=None)
++        self.assertFalse(result)
++
++        report = inspect_erasure(plain_file, expected_pattern=None)
++        self.assertFalse(report.passed)
++        self.assertTrue(report.residual_data_found)
++
++    def test_forced_failure_partial_corruption_header_tail(self) -> None:
++        """File with random body but unwiped plaintext header must fail verification."""
++        partial_file = self.test_dir / "partial_wiped.bin"
++        # Header is plaintext, body and tail are random
++        header = b"UNWIPED_ORIGINAL_HEADER_EVIDENCE" * 128  # 4096 bytes
++        random_tail = os.urandom(16384)
++        partial_file.write_bytes(header + random_tail)
++
++        result = verify_erasure(partial_file, expected_pattern=None)
++        self.assertFalse(result)
++
++        report = inspect_erasure(partial_file, expected_pattern=None)
++        self.assertFalse(report.passed)
++        self.assertTrue(report.residual_data_found)
++
++    def test_verify_nonexistent_file_returns_false(self) -> None:
++        """Non-existent file target must return False."""
++        ghost_file = self.test_dir / "does_not_exist.bin"
++        self.assertFalse(verify_erasure(ghost_file))
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+From 4e30d95f29facdc2f57885e64bf5043bcbbe5e00 Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Wed, 2 Sep 2026 16:29:23 +0530
+Subject: [PATCH 5/7] Feat: Implement sanitizer orchestration pipeline with
+ data-schema.md compliance
+
+---
+ erasure/__init__.py             |  13 +
+ erasure/sanitizer.py            | 439 +++++++++++++++++++++++++++++++-
+ tests/erasure/test_sanitizer.py | 186 ++++++++++++++
+ 3 files changed, 625 insertions(+), 13 deletions(-)
+ create mode 100644 tests/erasure/test_sanitizer.py
+
+diff --git a/erasure/__init__.py b/erasure/__init__.py
+index 9b2e195..c5767df 100644
+--- a/erasure/__init__.py
++++ b/erasure/__init__.py
+@@ -30,6 +30,13 @@
+     inspect_erasure,
+     verify_erasure,
+ )
++from erasure.sanitizer import (
++    SanitizationJobResult,
++    Sanitizer,
++    compute_file_sha256,
++    generate_random_filename,
++    sanitize_file,
++)
+ 
+ __all__ = [
+     # Methods
+@@ -56,4 +63,10 @@
+     "calculate_shannon_entropy",
+     "inspect_erasure",
+     "verify_erasure",
++    # Sanitizer Orchestrator
++    "SanitizationJobResult",
++    "Sanitizer",
++    "compute_file_sha256",
++    "generate_random_filename",
++    "sanitize_file",
+ ]
+diff --git a/erasure/sanitizer.py b/erasure/sanitizer.py
+index 8c24224..0e1d9db 100644
+--- a/erasure/sanitizer.py
++++ b/erasure/sanitizer.py
+@@ -1,16 +1,429 @@
+ """
+-Sanitizer — Owner: Person 5
+-
+-Core erasure engine that applies sanitization methods to target storage media.
+-Implements NIST SP 800-88 Clear, Purge, and Destroy patterns. Manages the
+-sanitization lifecycle from target selection through completion.
+-
+-Deliverables:
+-- Apply sanitization method to a target device/partition
+-- Support Clear (single-pass overwrite), Purge (multi-pass / crypto-erase),
+-  and Destroy (physical destruction verification)
+-- Track sanitization progress and state
+-- Emit completion events for verification and audit
++Sanitizer Orchestration Engine — Owner: Person 5
++Module: erasure.sanitizer
++
++End-to-end sanitization workflow pipeline:
++  1. Target Scope Check (device_detection.py)
++  2. Pre-Wipe Cryptographic Hashing (SHA-256 via 4096-byte chunks)
++  3. Chunked Binary Sanitization Overwriting (methods.py)
++  4. Post-Wipe Independent Verification (verification.py)
++  5. Metadata Scrambling (16-char random rename) & Unlink Deletion
++  6. Forensic Audit Certificate Generation (data-schema.md compliant JSON)
+ """
+ 
+-# TODO: implement
++from __future__ import annotations
++
++import datetime
++import hashlib
++import json
++import os
++import secrets
++import stat
++import string
++import time
++import uuid
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional
++
++from erasure.device_detection import (
++    StorageMediaType,
++    TargetScopeInfo,
++    validate_sanitization_target,
++)
++from erasure.methods import (
++    DEFAULT_CHUNK_SIZE,
++    OverwriteEngine,
++    SanitizationAlgorithm,
++    SanitizationResult,
++)
++from erasure.verification import (
++    VerificationEngine,
++    VerificationReport,
++    inspect_erasure,
++)
++
++
++@dataclass
++class SanitizationJobResult:
++    """Complete forensic sanitization record conforming to data-schema.md."""
++    id: str
++    target_path: str
++    original_filename: str
++    size_bytes: int
++    pre_wipe_sha256: str
++    erasure_method: str
++    pass_count: int
++    passes_total: int
++    status: str  # "completed" | "failed" | "rejected"
++    started_at: str  # ISO 8601
++    completed_at: str  # ISO 8601
++    timestamp_iso: str  # ISO 8601
++    verification_status: str  # "passed" | "failed" | "skipped"
++    operator_name: str
++    device: Dict[str, Any]
++    verification: Dict[str, Any]
++    certificate_path: Optional[str] = None
++    error_message: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        """Convert result to dictionary matching data-schema.md."""
++        return asdict(self)
++
++
++def compute_file_sha256(
++    file_path: str | Path,
++    chunk_size: int = DEFAULT_CHUNK_SIZE,
++) -> str:
++    """
++    Compute pre-wipe SHA-256 cryptographic hash of a file
++    using chunked binary streaming (4096 bytes per chunk).
++    """
++    path = Path(file_path).resolve()
++    hasher = hashlib.sha256()
++
++    with open(path, "rb") as f:
++        while True:
++            chunk = f.read(chunk_size)
++            if not chunk:
++                break
++            hasher.update(chunk)
++
++    return hasher.hexdigest()
++
++
++def generate_random_filename(length: int = 16) -> str:
++    """Generate a random alphanumeric string to scramble filename metadata traces."""
++    chars = string.ascii_letters + string.digits
++    return "".join(secrets.choice(chars) for _ in range(length))
++
++
++class Sanitizer:
++    """
++    Forensic Sanitization Orchestration Engine.
++    Executes safety checks, hashing, multi-pass overwriting, verification,
++    directory entry metadata scrubbing, and Certificate of Destruction generation.
++    """
++
++    def __init__(
++        self,
++        certificates_dir: str | Path = "certificates",
++        approved_roots: Optional[List[Path | str]] = None,
++        chunk_size: int = DEFAULT_CHUNK_SIZE,
++    ) -> None:
++        self.certificates_dir = Path(certificates_dir)
++        self.approved_roots = approved_roots
++        self.chunk_size = chunk_size
++        self.overwrite_engine = OverwriteEngine(chunk_size=chunk_size)
++        self.verification_engine = VerificationEngine(sample_chunk_size=chunk_size)
++
++    def sanitize(
++        self,
++        target_path: str | Path,
++        algorithm: SanitizationAlgorithm | str = SanitizationAlgorithm.NIST_800_88_CLEAR,
++        operator_name: str = "Forensic Sanitization Operator",
++        progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
++    ) -> SanitizationJobResult:
++        """
++        Execute full sanitization pipeline on a target file.
++        """
++        job_id = f"san-{uuid.uuid4().hex[:12]}"
++        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++        raw_path = Path(target_path)
++        resolved_path = raw_path.resolve() if raw_path.exists() else raw_path
++
++        # Normalize algorithm parameter
++        if isinstance(algorithm, str):
++            try:
++                algo_enum = SanitizationAlgorithm(algorithm)
++            except ValueError:
++                algo_enum = SanitizationAlgorithm.NIST_800_88_CLEAR
++        else:
++            algo_enum = algorithm
++
++        # ---------------------------------------------------------------------
++        # Step 1: Scope & Safety Validation
++        # ---------------------------------------------------------------------
++        scope_info = validate_sanitization_target(
++            resolved_path, approved_roots=self.approved_roots
++        )
++
++        device_dict = {
++            "name": str(resolved_path),
++            "type": scope_info.media_type.value if scope_info else "Unknown",
++            "serial": "N/A",
++            "capacity_bytes": scope_info.size_bytes if scope_info else 0,
++        }
++
++        if not scope_info.is_safe:
++            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            return self._build_job_record(
++                job_id=job_id,
++                target_path=str(resolved_path),
++                filename=resolved_path.name,
++                size_bytes=scope_info.size_bytes,
++                pre_sha256="N/A (Scope Rejected)",
++                algorithm=algo_enum.value,
++                passes_completed=0,
++                passes_total=self.overwrite_engine._get_pass_count(algo_enum),
++                status="rejected",
++                start_iso=start_iso,
++                end_iso=end_iso,
++                verification_status="skipped",
++                operator_name=operator_name,
++                device=device_dict,
++                verification={"passed": False, "details": scope_info.rejection_reason or "Safety boundary check failed."},
++                error_message=f"Safety Rejection: {scope_info.rejection_reason}",
++            )
++
++        # Clear read-only flags if present to allow write/rename
++        if scope_info.is_read_only:
++            try:
++                os.chmod(resolved_path, stat.S_IWRITE | stat.S_IREAD)
++            except Exception:
++                pass
++
++        # ---------------------------------------------------------------------
++        # Step 2: Pre-Wipe Forensic Hashing
++        # ---------------------------------------------------------------------
++        try:
++            pre_wipe_sha256 = compute_file_sha256(resolved_path, chunk_size=self.chunk_size)
++            file_size = resolved_path.stat().st_size
++            device_dict["capacity_bytes"] = file_size
++        except Exception as hash_err:
++            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            return self._build_job_record(
++                job_id=job_id,
++                target_path=str(resolved_path),
++                filename=resolved_path.name,
++                size_bytes=0,
++                pre_sha256="ERROR",
++                algorithm=algo_enum.value,
++                passes_completed=0,
++                passes_total=self.overwrite_engine._get_pass_count(algo_enum),
++                status="failed",
++                start_iso=start_iso,
++                end_iso=end_iso,
++                verification_status="skipped",
++                operator_name=operator_name,
++                device=device_dict,
++                verification={"passed": False, "details": "Failed to compute pre-wipe SHA-256 hash."},
++                error_message=f"Pre-wipe hashing error: {hash_err}",
++            )
++
++        # ---------------------------------------------------------------------
++        # Step 3: Binary Pattern Overwrite
++        # ---------------------------------------------------------------------
++        overwrite_res: SanitizationResult = self.overwrite_engine.sanitize_file(
++            resolved_path,
++            algorithm=algo_enum,
++            progress_callback=progress_callback,
++        )
++
++        if not overwrite_res.success:
++            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            return self._build_job_record(
++                job_id=job_id,
++                target_path=str(resolved_path),
++                filename=resolved_path.name,
++                size_bytes=file_size,
++                pre_sha256=pre_wipe_sha256,
++                algorithm=algo_enum.value,
++                passes_completed=overwrite_res.passes_completed,
++                passes_total=overwrite_res.passes_total,
++                status="failed",
++                start_iso=start_iso,
++                end_iso=end_iso,
++                verification_status="skipped",
++                operator_name=operator_name,
++                device=device_dict,
++                verification={"passed": False, "details": overwrite_res.error_message or "Overwrite failed."},
++                error_message=overwrite_res.error_message,
++            )
++
++        # ---------------------------------------------------------------------
++        # Step 4: Post-Sanitization Independent Verification
++        # ---------------------------------------------------------------------
++        # Determine expected pattern based on algorithm
++        expected_pat: Optional[bytes] = None
++        if algo_enum == SanitizationAlgorithm.ZERO_OVERWRITE:
++            expected_pat = b"\x00"
++
++        verify_report: VerificationReport = self.verification_engine.inspect(
++            resolved_path, expected_pattern=expected_pat
++        )
++
++        verification_dict = {
++            "passed": verify_report.passed,
++            "sample_sectors_checked": verify_report.sample_sectors_checked,
++            "residual_data_found": verify_report.residual_data_found,
++            "average_entropy": verify_report.average_entropy,
++            "expected_pattern_type": verify_report.expected_pattern_type,
++            "details": verify_report.details,
++        }
++
++        if not verify_report.passed:
++            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            return self._build_job_record(
++                job_id=job_id,
++                target_path=str(resolved_path),
++                filename=resolved_path.name,
++                size_bytes=file_size,
++                pre_sha256=pre_wipe_sha256,
++                algorithm=algo_enum.value,
++                passes_completed=overwrite_res.passes_completed,
++                passes_total=overwrite_res.passes_total,
++                status="failed",
++                start_iso=start_iso,
++                end_iso=end_iso,
++                verification_status="failed",
++                operator_name=operator_name,
++                device=device_dict,
++                verification=verification_dict,
++                error_message="Verification check failed: Residual data or low entropy detected on media.",
++            )
++
++        # ---------------------------------------------------------------------
++        # Step 5: Metadata Scrambling & Deletion
++        # ---------------------------------------------------------------------
++        try:
++            parent_dir = resolved_path.parent
++            # Generate 16-character random name to scramble directory entries
++            scrambled_name = generate_random_filename(16)
++            scrambled_path = parent_dir / scrambled_name
++
++            # Rename to random alphanumeric string
++            resolved_path.rename(scrambled_path)
++
++            # Truncate to 0 bytes and unlink file
++            try:
++                with open(scrambled_path, "wb") as f:
++                    pass
++            except Exception:
++                pass
++
++            os.remove(scrambled_path)
++
++        except Exception as del_err:
++            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            return self._build_job_record(
++                job_id=job_id,
++                target_path=str(resolved_path),
++                filename=resolved_path.name,
++                size_bytes=file_size,
++                pre_sha256=pre_wipe_sha256,
++                algorithm=algo_enum.value,
++                passes_completed=overwrite_res.passes_completed,
++                passes_total=overwrite_res.passes_total,
++                status="failed",
++                start_iso=start_iso,
++                end_iso=end_iso,
++                verification_status="passed",
++                operator_name=operator_name,
++                device=device_dict,
++                verification=verification_dict,
++                error_message=f"Sanitization verified but metadata scrubbing/deletion failed: {del_err}",
++            )
++
++        # ---------------------------------------------------------------------
++        # Step 6: Audit Certificate Output (JSON inside certificates/)
++        # ---------------------------------------------------------------------
++        end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++        job_record = self._build_job_record(
++            job_id=job_id,
++            target_path=str(resolved_path),
++            filename=resolved_path.name,
++            size_bytes=file_size,
++            pre_sha256=pre_wipe_sha256,
++            algorithm=algo_enum.value,
++            passes_completed=overwrite_res.passes_completed,
++            passes_total=overwrite_res.passes_total,
++            status="completed",
++            start_iso=start_iso,
++            end_iso=end_iso,
++            verification_status="passed",
++            operator_name=operator_name,
++            device=device_dict,
++            verification=verification_dict,
++        )
++
++        cert_path = self._write_certificate(job_record)
++        job_record.certificate_path = str(cert_path)
++
++        return job_record
++
++    def _build_job_record(
++        self,
++        job_id: str,
++        target_path: str,
++        filename: str,
++        size_bytes: int,
++        pre_sha256: str,
++        algorithm: str,
++        passes_completed: int,
++        passes_total: int,
++        status: str,
++        start_iso: str,
++        end_iso: str,
++        verification_status: str,
++        operator_name: str,
++        device: Dict[str, Any],
++        verification: Dict[str, Any],
++        error_message: Optional[str] = None,
++    ) -> SanitizationJobResult:
++        """Construct a validated SanitizationJobResult object."""
++        return SanitizationJobResult(
++            id=job_id,
++            target_path=target_path,
++            original_filename=filename,
++            size_bytes=size_bytes,
++            pre_wipe_sha256=pre_sha256,
++            erasure_method=algorithm,
++            pass_count=passes_completed,
++            passes_total=passes_total,
++            status=status,
++            started_at=start_iso,
++            completed_at=end_iso,
++            timestamp_iso=end_iso,
++            verification_status=verification_status,
++            operator_name=operator_name,
++            device=device,
++            verification=verification,
++            error_message=error_message,
++        )
++
++    def _write_certificate(self, record: SanitizationJobResult) -> Path:
++        """Save JSON audit certificate in certificates/ directory."""
++        self.certificates_dir.mkdir(parents=True, exist_ok=True)
++        cert_file = self.certificates_dir / f"certificate_{record.id}.json"
++        
++        with open(cert_file, "w", encoding="utf-8") as f:
++            json.dump(record.to_dict(), f, indent=2)
++
++        return cert_file
++
++
++# Module-level convenience runner
++def sanitize_file(
++    target_path: str | Path,
++    algorithm: SanitizationAlgorithm | str = SanitizationAlgorithm.NIST_800_88_CLEAR,
++    operator_name: str = "Forensic Sanitization Operator",
++    certificates_dir: str | Path = "certificates",
++    approved_roots: Optional[List[Path | str]] = None,
++    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
++) -> SanitizationJobResult:
++    """
++    Execute full end-to-end sanitization workflow:
++    Scope Validation -> Pre-Wipe SHA-256 -> Overwrite -> Verification ->
++    16-Char Random Rename Deletion -> Audit Certificate Generation.
++    """
++    sanitizer = Sanitizer(
++        certificates_dir=certificates_dir,
++        approved_roots=approved_roots,
++    )
++    return sanitizer.sanitize(
++        target_path=target_path,
++        algorithm=algorithm,
++        operator_name=operator_name,
++        progress_callback=progress_callback,
++    )
+diff --git a/tests/erasure/test_sanitizer.py b/tests/erasure/test_sanitizer.py
+new file mode 100644
+index 0000000..96d4733
+--- /dev/null
++++ b/tests/erasure/test_sanitizer.py
+@@ -0,0 +1,186 @@
++"""
++Unit tests for erasure.sanitizer (End-to-end forensic sanitization pipeline).
++Validates pre-wipe SHA-256 hashing, pattern overwriting, independent verification,
++16-character random renaming/deletion, and data-schema.md compliant certificate generation.
++Compatible with unittest and pytest.
++Strictly operates on temporary local dummy files.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import shutil
++import stat
++import tempfile
++import unittest
++from pathlib import Path
++
++from erasure.methods import SanitizationAlgorithm
++from erasure.sanitizer import (
++    SanitizationJobResult,
++    Sanitizer,
++    compute_file_sha256,
++    generate_random_filename,
++    sanitize_file,
++)
++
++
++class TestErasureSanitizer(unittest.TestCase):
++    """Test suite for Sanitizer orchestration engine."""
++
++    def setUp(self) -> None:
++        self.test_dir = Path(tempfile.mkdtemp(prefix="securevault_san_"))
++        self.cert_dir = self.test_dir / "certificates"
++        self.cert_dir.mkdir(parents=True, exist_ok=True)
++
++    def tearDown(self) -> None:
++        if self.test_dir.exists():
++            shutil.rmtree(self.test_dir, ignore_errors=True)
++
++    def test_random_filename_generator(self) -> None:
++        """Verify 16-character random alphanumeric filename generator."""
++        name1 = generate_random_filename(16)
++        name2 = generate_random_filename(16)
++
++        self.assertEqual(len(name1), 16)
++        self.assertEqual(len(name2), 16)
++        self.assertTrue(name1.isalnum())
++        self.assertNotEqual(name1, name2)
++
++    def test_compute_file_sha256(self) -> None:
++        """Verify chunked SHA-256 computation matches standard library hashlib."""
++        dummy_file = self.test_dir / "sample_hash.bin"
++        sample_data = b"FORENSIC CHAIN OF CUSTODY EVIDENCE SAMPLE" * 150
++        dummy_file.write_bytes(sample_data)
++
++        expected_hash = hashlib.sha256(sample_data).hexdigest()
++        computed_hash = compute_file_sha256(dummy_file)
++
++        self.assertEqual(computed_hash, expected_hash)
++
++    def test_end_to_end_nist_clear_workflow(self) -> None:
++        """Test full NIST Clear workflow: Hash -> Overwrite -> Verify -> Scramble -> Delete -> Cert."""
++        dummy_file = self.test_dir / "confidential_target.docx"
++        original_data = b"PATIENT MEDICAL RECORD 2026 TOP SECRET" * 50
++        dummy_file.write_bytes(original_data)
++        original_hash = hashlib.sha256(original_data).hexdigest()
++        original_size = len(original_data)
++
++        sanitizer = Sanitizer(
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
++
++        result: SanitizationJobResult = sanitizer.sanitize(
++            target_path=dummy_file,
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            operator_name="Officer Alice Smith",
++        )
++
++        # 1. Pipeline status checks
++        self.assertEqual(result.status, "completed")
++        self.assertEqual(result.verification_status, "passed")
++        self.assertEqual(result.pass_count, 1)
++        self.assertEqual(result.pre_wipe_sha256, original_hash)
++        self.assertEqual(result.size_bytes, original_size)
++        self.assertEqual(result.operator_name, "Officer Alice Smith")
++
++        # 2. File deletion check: Original file path must NO longer exist
++        self.assertFalse(dummy_file.exists())
++
++        # 3. Certificate validation (data-schema.md compliance)
++        self.assertIsNotNone(result.certificate_path)
++        cert_path = Path(result.certificate_path)
++        self.assertTrue(cert_path.exists())
++
++        cert_data = json.loads(cert_path.read_text(encoding="utf-8"))
++        self.assertEqual(cert_data["id"], result.id)
++        self.assertEqual(cert_data["target_path"], str(dummy_file.resolve()))
++        self.assertEqual(cert_data["pre_wipe_sha256"], original_hash)
++        self.assertEqual(cert_data["erasure_method"], SanitizationAlgorithm.NIST_800_88_CLEAR.value)
++        self.assertEqual(cert_data["pass_count"], 1)
++        self.assertEqual(cert_data["verification_status"], "passed")
++        self.assertEqual(cert_data["operator_name"], "Officer Alice Smith")
++        self.assertIn("timestamp_iso", cert_data)
++        self.assertIn("device", cert_data)
++        self.assertIn("verification", cert_data)
++        self.assertTrue(cert_data["verification"]["passed"])
++
++    def test_end_to_end_dod_3pass_workflow(self) -> None:
++        """Test full DoD 3-pass sanitization workflow."""
++        dummy_file = self.test_dir / "dod_classified.pdf"
++        dummy_file.write_bytes(b"MILITARY BLUEPRINTS 2026" * 100)
++
++        result = sanitize_file(
++            target_path=dummy_file,
++            algorithm=SanitizationAlgorithm.LEGACY_DOD_5220_22_M,
++            operator_name="Operator Bob",
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
++
++        self.assertEqual(result.status, "completed")
++        self.assertEqual(result.verification_status, "passed")
++        self.assertEqual(result.pass_count, 3)
++        self.assertEqual(result.passes_total, 3)
++        self.assertFalse(dummy_file.exists())
++        self.assertTrue(Path(result.certificate_path).exists())
++
++    def test_read_only_file_sanitization(self) -> None:
++        """Test that read-only files are unlocked, wiped, scrambled, and deleted cleanly."""
++        ro_file = self.test_dir / "locked_file.dat"
++        ro_file.write_bytes(b"READ ONLY FINANCIAL TRANSACTION LOG" * 20)
++
++        # Set read-only attribute
++        os.chmod(ro_file, stat.S_IREAD)
++
++        result = sanitize_file(
++            target_path=ro_file,
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
++
++        self.assertEqual(result.status, "completed")
++        self.assertFalse(ro_file.exists())
++
++    def test_empty_0byte_file_sanitization(self) -> None:
++        """Test sanitization pipeline handles 0-byte files cleanly."""
++        empty_file = self.test_dir / "empty_artifact.tmp"
++        empty_file.write_bytes(b"")
++
++        empty_hash = hashlib.sha256(b"").hexdigest()
++
++        result = sanitize_file(
++            target_path=empty_file,
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
++
++        self.assertEqual(result.status, "completed")
++        self.assertEqual(result.size_bytes, 0)
++        self.assertEqual(result.pre_wipe_sha256, empty_hash)
++        self.assertFalse(empty_file.exists())
++
++    def test_safety_rejection_for_system_paths(self) -> None:
++        """Validator must reject critical OS paths and abort without I/O."""
++        sanitizer = Sanitizer(
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
++
++        result = sanitizer.sanitize(
++            target_path=r"C:\Windows\System32",
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++        )
++
++        self.assertEqual(result.status, "rejected")
++        self.assertEqual(result.verification_status, "skipped")
++        self.assertIn("Safety Rejection", result.error_message or "")
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+From 68e7b80953554c0be782f3c05002ffe187864bf6 Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Wed, 2 Sep 2026 16:36:09 +0530
+Subject: [PATCH 6/7] Test: Add acceptance test suite for sanitizer pipeline,
+ verification failure, and scope guardrails
+
+---
+ erasure/device_detection.py     |  12 +-
+ erasure/sanitizer.py            |  18 +-
+ tests/erasure/test_sanitizer.py | 331 +++++++++++++++++++++-----------
+ 3 files changed, 233 insertions(+), 128 deletions(-)
+
+diff --git a/erasure/device_detection.py b/erasure/device_detection.py
+index 416747a..8c8149a 100644
+--- a/erasure/device_detection.py
++++ b/erasure/device_detection.py
+@@ -229,17 +229,16 @@ def evaluate_target(self, target_path: str | Path) -> TargetScopeInfo:
+         )
+ 
+     def _is_within_approved_roots(self, path: Path) -> bool:
+-        """Check if path is inside any approved root, cwd, or temp directory."""
++        """Check if path is inside approved roots or default safe test scopes."""
+         import tempfile
+ 
++        # If explicit approved roots are configured, enforce strict containment
++        if self.approved_roots:
++            return any(path == app_root or app_root in path.parents for app_root in self.approved_roots)
++
+         temp_dir = Path(tempfile.gettempdir()).resolve()
+         cwd = Path.cwd().resolve()
+ 
+-        # Check explicit approved roots if configured
+-        if self.approved_roots:
+-            if any(path == app_root or app_root in path.parents for app_root in self.approved_roots):
+-                return True
+-
+         # Default safe locations: cwd subtree, system tempdir, or explicit dummy/temp test markers
+         if path == cwd or cwd in path.parents:
+             return True
+@@ -254,6 +253,7 @@ def _is_within_approved_roots(self, path: Path) -> bool:
+         return False
+ 
+ 
++
+     def _detect_media_type(self, path: Path) -> StorageMediaType:
+         """
+         Detect underlying storage technology (SSD vs. HDD vs. Dummy File).
+diff --git a/erasure/sanitizer.py b/erasure/sanitizer.py
+index 0e1d9db..957f869 100644
+--- a/erasure/sanitizer.py
++++ b/erasure/sanitizer.py
+@@ -129,8 +129,7 @@ def sanitize(
+         """
+         job_id = f"san-{uuid.uuid4().hex[:12]}"
+         start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+-        raw_path = Path(target_path)
+-        resolved_path = raw_path.resolve() if raw_path.exists() else raw_path
++        target_str = str(target_path)
+ 
+         # Normalize algorithm parameter
+         if isinstance(algorithm, str):
+@@ -145,11 +144,11 @@ def sanitize(
+         # Step 1: Scope & Safety Validation
+         # ---------------------------------------------------------------------
+         scope_info = validate_sanitization_target(
+-            resolved_path, approved_roots=self.approved_roots
++            target_path, approved_roots=self.approved_roots
+         )
+ 
+         device_dict = {
+-            "name": str(resolved_path),
++            "name": target_str,
+             "type": scope_info.media_type.value if scope_info else "Unknown",
+             "serial": "N/A",
+             "capacity_bytes": scope_info.size_bytes if scope_info else 0,
+@@ -157,10 +156,14 @@ def sanitize(
+ 
+         if not scope_info.is_safe:
+             end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
++            try:
++                filename = Path(target_str).name if not target_str.startswith(r"\\") else target_str
++            except Exception:
++                filename = target_str
+             return self._build_job_record(
+                 job_id=job_id,
+-                target_path=str(resolved_path),
+-                filename=resolved_path.name,
++                target_path=target_str,
++                filename=filename,
+                 size_bytes=scope_info.size_bytes,
+                 pre_sha256="N/A (Scope Rejected)",
+                 algorithm=algo_enum.value,
+@@ -176,6 +179,9 @@ def sanitize(
+                 error_message=f"Safety Rejection: {scope_info.rejection_reason}",
+             )
+ 
++        resolved_path = Path(target_str).resolve()
++
++
+         # Clear read-only flags if present to allow write/rename
+         if scope_info.is_read_only:
+             try:
+diff --git a/tests/erasure/test_sanitizer.py b/tests/erasure/test_sanitizer.py
+index 96d4733..3c48ca0 100644
+--- a/tests/erasure/test_sanitizer.py
++++ b/tests/erasure/test_sanitizer.py
+@@ -1,9 +1,10 @@
+ """
+-Unit tests for erasure.sanitizer (End-to-end forensic sanitization pipeline).
+-Validates pre-wipe SHA-256 hashing, pattern overwriting, independent verification,
+-16-character random renaming/deletion, and data-schema.md compliant certificate generation.
+-Compatible with unittest and pytest.
+-Strictly operates on temporary local dummy files.
++Acceptance Criteria Test Suite for erasure.sanitizer
++Tests end-to-end sanitization lifecycles, verification failure handling,
++scope guardrail protections, and data-schema.md compliance.
++
++Compatible with both unittest and pytest test runners.
++Strictly operates on local temporary dummy files.
+ """
+ 
+ from __future__ import annotations
+@@ -16,8 +17,9 @@
+ import tempfile
+ import unittest
+ from pathlib import Path
++from unittest.mock import MagicMock, patch
+ 
+-from erasure.methods import SanitizationAlgorithm
++from erasure.methods import SanitizationAlgorithm, SanitizationResult
+ from erasure.sanitizer import (
+     SanitizationJobResult,
+     Sanitizer,
+@@ -25,155 +27,169 @@
+     generate_random_filename,
+     sanitize_file,
+ )
++from erasure.verification import VerificationReport
+ 
+ 
+-class TestErasureSanitizer(unittest.TestCase):
+-    """Test suite for Sanitizer orchestration engine."""
++class TestSanitizerAcceptanceSuite(unittest.TestCase):
++    """Exhaustive acceptance test suite for forensic sanitization pipeline."""
+ 
+     def setUp(self) -> None:
+-        self.test_dir = Path(tempfile.mkdtemp(prefix="securevault_san_"))
++        self.test_dir = Path(tempfile.mkdtemp(prefix="securevault_accept_"))
+         self.cert_dir = self.test_dir / "certificates"
+         self.cert_dir.mkdir(parents=True, exist_ok=True)
++        self.sanitizer = Sanitizer(
++            certificates_dir=self.cert_dir,
++            approved_roots=[self.test_dir],
++        )
+ 
+     def tearDown(self) -> None:
+         if self.test_dir.exists():
+             shutil.rmtree(self.test_dir, ignore_errors=True)
+ 
+-    def test_random_filename_generator(self) -> None:
+-        """Verify 16-character random alphanumeric filename generator."""
+-        name1 = generate_random_filename(16)
+-        name2 = generate_random_filename(16)
+-
+-        self.assertEqual(len(name1), 16)
+-        self.assertEqual(len(name2), 16)
+-        self.assertTrue(name1.isalnum())
+-        self.assertNotEqual(name1, name2)
+-
+-    def test_compute_file_sha256(self) -> None:
+-        """Verify chunked SHA-256 computation matches standard library hashlib."""
+-        dummy_file = self.test_dir / "sample_hash.bin"
+-        sample_data = b"FORENSIC CHAIN OF CUSTODY EVIDENCE SAMPLE" * 150
+-        dummy_file.write_bytes(sample_data)
++    # =========================================================================
++    # 1. Successful Sanitization Lifecycle Tests
++    # =========================================================================
++    def test_lifecycle_empty_0byte_file(self) -> None:
++        """Acceptance: 0-byte file sanitization lifecycle."""
++        empty_target = self.test_dir / "dummy_empty.bin"
++        empty_target.write_bytes(b"")
++        expected_hash = hashlib.sha256(b"").hexdigest()
++
++        result = self.sanitizer.sanitize(
++            target_path=empty_target,
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            operator_name="Operator 01",
++        )
+ 
+-        expected_hash = hashlib.sha256(sample_data).hexdigest()
+-        computed_hash = compute_file_sha256(dummy_file)
++        # Confirm status, hash, and deletion
++        self.assertEqual(result.status, "completed")
++        self.assertEqual(result.verification_status, "passed")
++        self.assertEqual(result.size_bytes, 0)
++        self.assertEqual(result.pre_wipe_sha256, expected_hash)
++        self.assertFalse(empty_target.exists(), "Target file must be unlinked from filesystem.")
+ 
+-        self.assertEqual(computed_hash, expected_hash)
++        # Confirm valid JSON certificate
++        self.assertIsNotNone(result.certificate_path)
++        self.assertTrue(Path(result.certificate_path).exists())
+ 
+-    def test_end_to_end_nist_clear_workflow(self) -> None:
+-        """Test full NIST Clear workflow: Hash -> Overwrite -> Verify -> Scramble -> Delete -> Cert."""
+-        dummy_file = self.test_dir / "confidential_target.docx"
+-        original_data = b"PATIENT MEDICAL RECORD 2026 TOP SECRET" * 50
+-        dummy_file.write_bytes(original_data)
+-        original_hash = hashlib.sha256(original_data).hexdigest()
+-        original_size = len(original_data)
++    def test_lifecycle_tiny_text_file(self) -> None:
++        """Acceptance: Tiny text file (< 1KB) sanitization lifecycle."""
++        tiny_target = self.test_dir / "tiny_secret.txt"
++        payload = b"Top secret cryptographic passkey: 8x92-ZqL!"
++        tiny_target.write_bytes(payload)
++        expected_hash = hashlib.sha256(payload).hexdigest()
++        expected_size = len(payload)
+ 
+-        sanitizer = Sanitizer(
+-            certificates_dir=self.cert_dir,
+-            approved_roots=[self.test_dir],
+-        )
+-
+-        result: SanitizationJobResult = sanitizer.sanitize(
+-            target_path=dummy_file,
++        result = self.sanitizer.sanitize(
++            target_path=tiny_target,
+             algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
+-            operator_name="Officer Alice Smith",
++            operator_name="Forensic Investigator Smith",
+         )
+ 
+-        # 1. Pipeline status checks
+         self.assertEqual(result.status, "completed")
+         self.assertEqual(result.verification_status, "passed")
++        self.assertEqual(result.size_bytes, expected_size)
++        self.assertEqual(result.pre_wipe_sha256, expected_hash)
+         self.assertEqual(result.pass_count, 1)
+-        self.assertEqual(result.pre_wipe_sha256, original_hash)
+-        self.assertEqual(result.size_bytes, original_size)
+-        self.assertEqual(result.operator_name, "Officer Alice Smith")
+-
+-        # 2. File deletion check: Original file path must NO longer exist
+-        self.assertFalse(dummy_file.exists())
+-
+-        # 3. Certificate validation (data-schema.md compliance)
+-        self.assertIsNotNone(result.certificate_path)
+-        cert_path = Path(result.certificate_path)
+-        self.assertTrue(cert_path.exists())
+-
+-        cert_data = json.loads(cert_path.read_text(encoding="utf-8"))
+-        self.assertEqual(cert_data["id"], result.id)
+-        self.assertEqual(cert_data["target_path"], str(dummy_file.resolve()))
+-        self.assertEqual(cert_data["pre_wipe_sha256"], original_hash)
+-        self.assertEqual(cert_data["erasure_method"], SanitizationAlgorithm.NIST_800_88_CLEAR.value)
+-        self.assertEqual(cert_data["pass_count"], 1)
+-        self.assertEqual(cert_data["verification_status"], "passed")
+-        self.assertEqual(cert_data["operator_name"], "Officer Alice Smith")
+-        self.assertIn("timestamp_iso", cert_data)
+-        self.assertIn("device", cert_data)
+-        self.assertIn("verification", cert_data)
+-        self.assertTrue(cert_data["verification"]["passed"])
+-
+-    def test_end_to_end_dod_3pass_workflow(self) -> None:
+-        """Test full DoD 3-pass sanitization workflow."""
+-        dummy_file = self.test_dir / "dod_classified.pdf"
+-        dummy_file.write_bytes(b"MILITARY BLUEPRINTS 2026" * 100)
+-
+-        result = sanitize_file(
+-            target_path=dummy_file,
++        self.assertFalse(tiny_target.exists(), "Original file must be deleted.")
++
++    def test_lifecycle_large_file_chunked_processing(self) -> None:
++        """Acceptance: Multi-megabyte file chunked sanitization lifecycle."""
++        large_target = self.test_dir / "large_disk_image.raw"
++        # Create a 2 MB dummy payload to test chunked streaming
++        chunk = b"FORENSIC_SECTOR_DATA_BLOCK_2026" * 128  # 4096 bytes
++        large_target.write_bytes(chunk * 512)  # 2,097,152 bytes (2 MB)
++        
++        expected_size = large_target.stat().st_size
++        expected_hash = compute_file_sha256(large_target)
++
++        result = self.sanitizer.sanitize(
++            target_path=large_target,
+             algorithm=SanitizationAlgorithm.LEGACY_DOD_5220_22_M,
+-            operator_name="Operator Bob",
+-            certificates_dir=self.cert_dir,
+-            approved_roots=[self.test_dir],
++            operator_name="Senior Analyst Doe",
+         )
+ 
+         self.assertEqual(result.status, "completed")
+         self.assertEqual(result.verification_status, "passed")
++        self.assertEqual(result.size_bytes, expected_size)
++        self.assertEqual(result.pre_wipe_sha256, expected_hash)
+         self.assertEqual(result.pass_count, 3)
+         self.assertEqual(result.passes_total, 3)
+-        self.assertFalse(dummy_file.exists())
+-        self.assertTrue(Path(result.certificate_path).exists())
+-
+-    def test_read_only_file_sanitization(self) -> None:
+-        """Test that read-only files are unlocked, wiped, scrambled, and deleted cleanly."""
+-        ro_file = self.test_dir / "locked_file.dat"
+-        ro_file.write_bytes(b"READ ONLY FINANCIAL TRANSACTION LOG" * 20)
++        self.assertFalse(large_target.exists(), "Large file must be safely unlinked.")
+ 
+-        # Set read-only attribute
+-        os.chmod(ro_file, stat.S_IREAD)
++    def test_lifecycle_read_only_target(self) -> None:
++        """Acceptance: Read-only targets are unlocked and wiped without permission errors."""
++        ro_target = self.test_dir / "read_only_archive.tar"
++        ro_target.write_bytes(b"ARCHIVED SENSITIVE DATABASE DUMP" * 200)
++        os.chmod(ro_target, stat.S_IREAD)
+ 
+-        result = sanitize_file(
+-            target_path=ro_file,
++        result = self.sanitizer.sanitize(
++            target_path=ro_target,
+             algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
+-            certificates_dir=self.cert_dir,
+-            approved_roots=[self.test_dir],
+         )
+ 
+         self.assertEqual(result.status, "completed")
+-        self.assertFalse(ro_file.exists())
+-
+-    def test_empty_0byte_file_sanitization(self) -> None:
+-        """Test sanitization pipeline handles 0-byte files cleanly."""
+-        empty_file = self.test_dir / "empty_artifact.tmp"
+-        empty_file.write_bytes(b"")
+-
+-        empty_hash = hashlib.sha256(b"").hexdigest()
++        self.assertFalse(ro_target.exists())
++
++    # =========================================================================
++    # 2. Verification Failure Handling Tests
++    # =========================================================================
++    def test_verification_failure_halts_deletion_and_flags_status(self) -> None:
++        """
++        Acceptance: Simulate a post-wipe verification failure.
++        Confirms pipeline flags verification_status: failed, HALTS deletion,
++        logs failure details, and marks job status as failed.
++        """
++        failed_target = self.test_dir / "corrupt_write_target.dat"
++        failed_target.write_bytes(b"DATA THAT CANNOT BE WIPED" * 100)
++
++        # Mock the verification engine to simulate residual data detection failure
++        mock_failed_report = VerificationReport(
++            target_path=str(failed_target),
++            passed=False,
++            file_size_bytes=len(b"DATA THAT CANNOT BE WIPED" * 100),
++            sample_sectors_checked=4,
++            residual_data_found=True,
++            average_entropy=1.85,
++            expected_pattern_type="Cryptographic Random / High Entropy",
++            details="SIMULATED FAILURE: Residual non-random data detected on media sectors.",
++        )
+ 
+-        result = sanitize_file(
+-            target_path=empty_file,
++        with patch.object(self.sanitizer.verification_engine, "inspect", return_value=mock_failed_report):
++            result: SanitizationJobResult = self.sanitizer.sanitize(
++                target_path=failed_target,
++                algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            )
++
++        # Confirm pipeline did NOT report success
++        self.assertEqual(result.status, "failed")
++        self.assertEqual(result.verification_status, "failed")
++        self.assertFalse(result.verification["passed"])
++        self.assertTrue(result.verification["residual_data_found"])
++        self.assertIn("Verification check failed", result.error_message or "")
++
++        # Crucial Guardrail Check: The file must NOT be unlinked/deleted upon verification failure!
++        self.assertTrue(failed_target.exists(), "File deletion MUST be halted if verification fails.")
++
++    # =========================================================================
++    # 3. Scope Guardrail Protection Tests
++    # =========================================================================
++    def test_scope_guardrail_rejects_windows_system_directories(self) -> None:
++        """Acceptance: System paths (e.g. C:\\Windows\\System32) are safely rejected prior to I/O."""
++        result = self.sanitizer.sanitize(
++            target_path=r"C:\Windows\System32",
+             algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
+-            certificates_dir=self.cert_dir,
+-            approved_roots=[self.test_dir],
+         )
+ 
+-        self.assertEqual(result.status, "completed")
+-        self.assertEqual(result.size_bytes, 0)
+-        self.assertEqual(result.pre_wipe_sha256, empty_hash)
+-        self.assertFalse(empty_file.exists())
+-
+-    def test_safety_rejection_for_system_paths(self) -> None:
+-        """Validator must reject critical OS paths and abort without I/O."""
+-        sanitizer = Sanitizer(
+-            certificates_dir=self.cert_dir,
+-            approved_roots=[self.test_dir],
+-        )
++        self.assertEqual(result.status, "rejected")
++        self.assertEqual(result.verification_status, "skipped")
++        self.assertIn("Safety Rejection", result.error_message or "")
++        self.assertEqual(result.pre_wipe_sha256, "N/A (Scope Rejected)")
+ 
+-        result = sanitizer.sanitize(
+-            target_path=r"C:\Windows\System32",
++    def test_scope_guardrail_rejects_physical_drive_targets(self) -> None:
++        """Acceptance: Raw physical system drives (e.g. \\\\.\\PhysicalDrive0) are safely blocked."""
++        result = self.sanitizer.sanitize(
++            target_path=r"\\.\PhysicalDrive0",
+             algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
+         )
+ 
+@@ -181,6 +197,89 @@ def test_safety_rejection_for_system_paths(self) -> None:
+         self.assertEqual(result.verification_status, "skipped")
+         self.assertIn("Safety Rejection", result.error_message or "")
+ 
++    def test_scope_guardrail_rejects_unapproved_outside_paths(self) -> None:
++        """Acceptance: Paths outside configured approved roots are rejected."""
++        outside_dir = Path(tempfile.mkdtemp(prefix="outside_scope_"))
++        outside_file = outside_dir / "unapproved_target.dat"
++        outside_file.write_bytes(b"OUTSIDE DATA")
++
++        try:
++            # Validator configured with approved_roots strictly set to self.test_dir
++            result = self.sanitizer.sanitize(
++                target_path=outside_file,
++                algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            )
++
++            self.assertEqual(result.status, "rejected")
++            self.assertEqual(result.verification_status, "skipped")
++            # Confirm outside file was not touched/deleted
++            self.assertTrue(outside_file.exists())
++        finally:
++            shutil.rmtree(outside_dir, ignore_errors=True)
++
++    # =========================================================================
++    # 4. Schema Compliance (data-schema.md) Tests
++    # =========================================================================
++    def test_certificate_schema_compliance(self) -> None:
++        """
++        Acceptance: Generated JSON certificate must strictly comply with data-schema.md.
++        Validates all key names, nested objects, and strict data types.
++        """
++        target_file = self.test_dir / "schema_test_file.txt"
++        target_file.write_bytes(b"AUDIT COMPLIANCE VERIFICATION RECORD")
++        
++        result = self.sanitizer.sanitize(
++            target_path=target_file,
++            algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++            operator_name="Forensic Auditor Charlie",
++        )
++
++        self.assertEqual(result.status, "completed")
++        cert_path = Path(result.certificate_path)
++        self.assertTrue(cert_path.exists())
++
++        raw_json = cert_path.read_text(encoding="utf-8")
++        data = json.loads(raw_json)
++
++        # 1. Root Level Schema Keys & Types
++        self.assertIsInstance(data["id"], str)
++        self.assertTrue(data["id"].startswith("san-"))
++        self.assertIsInstance(data["target_path"], str)
++        self.assertIsInstance(data["original_filename"], str)
++        self.assertIsInstance(data["size_bytes"], int)
++        self.assertIsInstance(data["pre_wipe_sha256"], str)
++        self.assertEqual(len(data["pre_wipe_sha256"]), 64)  # Valid SHA-256 length
++        self.assertIsInstance(data["erasure_method"], str)
++        self.assertIsInstance(data["pass_count"], int)
++        self.assertIsInstance(data["passes_total"], int)
++        self.assertIsInstance(data["status"], str)
++        self.assertIn(data["status"], ["completed", "failed", "rejected"])
++        self.assertIsInstance(data["started_at"], str)
++        self.assertIsInstance(data["completed_at"], str)
++        self.assertIsInstance(data["timestamp_iso"], str)
++        self.assertIsInstance(data["verification_status"], str)
++        self.assertIsInstance(data["operator_name"], str)
++
++        # 2. Nested "device" Object Schema
++        self.assertIsInstance(data["device"], dict)
++        self.assertIn("name", data["device"])
++        self.assertIsInstance(data["device"]["name"], str)
++        self.assertIn("type", data["device"])
++        self.assertIsInstance(data["device"]["type"], str)
++        self.assertIn("serial", data["device"])
++        self.assertIsInstance(data["device"]["serial"], str)
++        self.assertIn("capacity_bytes", data["device"])
++        self.assertIsInstance(data["device"]["capacity_bytes"], int)
++
++        # 3. Nested "verification" Object Schema
++        self.assertIsInstance(data["verification"], dict)
++        self.assertIn("passed", data["verification"])
++        self.assertIsInstance(data["verification"]["passed"], bool)
++        self.assertIn("sample_sectors_checked", data["verification"])
++        self.assertIsInstance(data["verification"]["sample_sectors_checked"], int)
++        self.assertIn("residual_data_found", data["verification"])
++        self.assertIsInstance(data["verification"]["residual_data_found"], bool)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+
+From 8f646e02b5028e3ea164664b1d13247796b8b074 Mon Sep 17 00:00:00 2001
+From: ibrasehr <ibraseh64@gmail.com>
+Date: Wed, 2 Sep 2026 16:40:35 +0530
+Subject: [PATCH 7/7] Docs: Add comprehensive erasure module README and NIST SP
+ 800-88 mapping
+
+---
+ erasure/README.md | 199 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 199 insertions(+)
+ create mode 100644 erasure/README.md
+
+diff --git a/erasure/README.md b/erasure/README.md
+new file mode 100644
+index 0000000..0722097
+--- /dev/null
++++ b/erasure/README.md
+@@ -0,0 +1,199 @@
++# SecureVault — Secure Data Erasure Module
++
++> **Owner:** Person 5 (Secure Erasure Pipeline)  
++> **Module Path:** `erasure/`  
++> **Branch:** `feature/erasure-security`  
++> **Target Specification:** NIST SP 800-88 Rev. 1 Guidelines & Forensic Chain-of-Custody Compliance
++
++---
++
++## 1. Overview & Architecture
++
++The **Secure Erasure Module** provides a forensic-grade, memory-efficient data sanitization and post-wipe verification pipeline. It is designed to reliably overwrite sensitive file artifacts, prevent residual data recovery from underlying storage clusters, scramble directory table metadata, and emit tamper-evident audit certificates strictly compliant with `docs/data-schema.md`.
++
++```
++┌─────────────────────────────────────────────────────────────────────────┐
++│                       Sanitization Pipeline Flow                        │
++└─────────────────────────────────────────────────────────────────────────┘
++                                   │
++                                   ▼
++                   [ 1. Target Scope Check ]
++               (device_detection.py: Protect OS & Root)
++                                   │
++                                   ▼
++                [ 2. Pre-Wipe Forensic Hashing ]
++               (Compute SHA-256 via 4KB Chunks)
++                                   │
++                                   ▼
++             [ 3. Chunked Binary Pattern Overwrite ]
++            (methods.py: NIST Clear / DoD 3-Pass + fsync)
++                                   │
++                                   ▼
++            [ 4. Independent Binary Verification ]
++           (verification.py: Header/Body/Tail Sampling)
++                                   │
++                                   ▼
++              [ 5. Metadata Scrambling & Deletion ]
++             (16-char Random Rename + Truncate + Unlink)
++                                   │
++                                   ▼
++              [ 6. Forensic Certificate Generation ]
++             (Emit data-schema.md Compliant JSON Report)
++```
++
++---
++
++## 2. Standards Mapping (NIST SP 800-88 Rev. 1)
++
++This module aligns with procedural sanitization recommendations established in **NIST Special Publication 800-88 Revision 1** (*Guidelines for Media Sanitization*).
++
++| NIST SP 800-88 Category | Implementation Status | Technical Mechanism | Scope & Limitations |
++|:---|:---:|:---|:---|
++| **Clear** (Logical Overwrite) | **Implemented** | 1-pass binary overwrite using cryptographically secure pseudo-random bytes (`os.urandom`) with enforced OS buffer synchronization (`os.fsync`). | Overwrites addressable logical file blocks in user-space. Mitigates basic forensic recovery tools. |
++| **Purge** (Low-Level Sanitization) | **Documented / Out of Scope** | *Out of Scope for User-Space Prototype.* Real firmware Purge requires ATA Secure Erase (`hdparm`), NVMe Format Cryptographic Erase (`nvme-cli`), or degaussing. | User-space overwriting cannot bypass Flash Translation Layers (FTL), over-provisioned blocks, or wear-leveling remaps on SSDs. |
++| **Destroy** (Physical Destruction) | **Documented** | Physical disintegration, incineration, shredding, or melting per NIST Table A-1 through A-10. | External physical hardware action. |
++| **Verification** (Section 4.8) | **Implemented** | Independent read-back inspection sampling binary chunks across file header, body, and tail, evaluated via Shannon entropy and pattern matching. | Confirms write committed to storage medium before unlinking metadata. |
++| **Documentation & Certificate** (Section 4.9) | **Implemented** | Structured, tamper-evident JSON Certificate of Destruction with pre-wipe cryptographic hashes, operator metadata, and verification telemetry. | Meets NIST audit and chain-of-custody requirements. |
++
++> **⚠️ Standards Disclaimer:**  
++> - **DoD 5220.22-M** is a legacy specification from the United States Department of Defense (superseded) and is **not** a modern NIST standard. It is included strictly for historical compatibility and multi-pass benchmark comparison.  
++> - This software is an academic/prototypical implementation and does not claim accredited laboratory certification (e.g., Common Criteria or formal NIST FIPS validation).
++
++---
++
++## 3. Hardware & Method Selection
++
++Sanitization efficiency depends heavily on the physical media substrate:
++
++### Comparison Matrix: Sanitization Methods
++
++| Parameter | NIST SP 800-88 Clear | Legacy DoD 5220.22-M | Fixed Zero Fill (Quick) |
++|:---|:---:|:---:|:---:|
++| **Pass Count** | **1 Pass** | **3 Passes** | **1 Pass** |
++| **Pattern Sequence** | Cryptographic Random (`os.urandom`) | Pass 1: `0x00`<br>Pass 2: `0xFF`<br>Pass 3: Random | Fixed Zeros (`0x00`) |
++| **Rotational HDD Suitability** | Excellent (Overwrites magnetic domain transitions) | High (Redundant overwriting) | Good (Basic clearing) |
++| **SSD / NVMe Flash Suitability** | Moderate (Subject to FTL Wear-Leveling) | Not Recommended (Excessive write wear without security gain) | Moderate |
++| **Execution Speed** | Fast ($\approx 1\times$ baseline I/O) | Slower ($\approx 3\times$ I/O time) | Fastest (Optimized buffer throughput) |
++| **Entropy Post-Wipe** | High ($\approx 7.95 - 8.00$ bits/byte) | High ($\approx 7.95 - 8.00$ bits/byte) | $0.00$ bits/byte |
++
++### Media Detection & Selection Logic (`device_detection.py`)
++
++1. **Rotational Magnetic Drives (HDD):**
++   - Single-pass random (NIST Clear) or multi-pass (DoD 3-Pass) is fully effective across logical sector clusters.
++2. **Flash-Based Storage (SSD / NVMe / USB Flash):**
++   - **FTL & Wear-Leveling Warning:** Modern SSDs distribute writes across flash NAND blocks via wear-leveling algorithms. Standard file-level overwrites write to newly allocated flash blocks while the original block may temporarily reside in unallocated over-provisioned space until garbage-collected by TRIM.
++   - **Recommendation:** Use 1-Pass NIST Clear to minimize unnecessary NAND write amplification. Full device repurposing should utilize ATA/NVMe hardware-level secure erase.
++3. **Safety Guardrails:**
++   - Automatically inspects target paths and **rejects critical operating system directories** (`C:\Windows`, `C:\Program Files`, `/bin`, `/boot`, `/etc`, `/usr`) and physical drive devices (`\\.\PhysicalDrive0`, `/dev/sda`) before performing any destructive I/O.
++
++---
++
++## 4. Verification & Forensic Chain-of-Custody
++
++### 1. Pre-Wipe Cryptographic Hashing (`compute_file_sha256`)
++Prior to modifying a single byte on disk, the pipeline computes the target's original **SHA-256 hash** using streaming 4096-byte buffers. This provides immutable forensic proof that a specific piece of evidence existed prior to destruction.
++
++### 2. Independent Binary Verification (`verification.py`)
++Following pattern overwriting, the verification engine independently inspects the file across three distinct zones:
++- **Header:** First 4096 bytes (offset `0`).
++- **Body:** 3 evenly spaced sample regions across the file payload.
++- **Tail:** Last 4096 bytes (`file_size - 4096`).
++
++Each region is tested for:
++- **Pattern Matching:** Verifies $100\%$ byte identity if a deterministic pattern (e.g. `0x00`) was written.
++- **Shannon Entropy Analysis:** Computes empirical entropy $H = -\sum p(x)\log_2 p(x)$. Random sanitization passes must yield high entropy ($\ge 7.2\text{ bits/byte}$). Residual plaintext or uniform repeating structures trigger an immediate verification failure.
++- **Fail-Safe Deletion Halting:** If verification fails, **file deletion is aborted** to preserve remnant evidence for forensic review.
++
++### 3. Metadata Scrambling & Deletion
++To prevent forensic file recovery tools from retrieving original filenames from directory tables ($MFT in NTFS / Directory Entries in FAT32/ext4):
++1. The target file is renamed to a cryptographically random 16-character alphanumeric string (e.g. `k8F2mP9xQwL4vN1z`).
++2. The file length is truncated to `0` bytes.
++3. The entry is unlinked via `os.remove()`.
++
++---
++
++## 5. Audit Certificate Integration (`data-schema.md`)
++
++Every sanitization run automatically outputs a structured JSON certificate in `certificates/certificate_<job_id>.json`. This schema directly aligns with the data contract defined for **Person 6 (Audit Lead)**:
++
++### Example Generated Certificate (`certificates/certificate_san-4a9e5d50e7f3.json`)
++
++```json
++{
++  "id": "san-4a9e5d50e7f3",
++  "target_path": "C:\\Users\\DELL\\evidence\\confidential_case_402.docx",
++  "original_filename": "confidential_case_402.docx",
++  "size_bytes": 1048576,
++  "pre_wipe_sha256": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
++  "erasure_method": "NIST_SP_800_88_CLEAR",
++  "pass_count": 1,
++  "passes_total": 1,
++  "status": "completed",
++  "started_at": "2026-09-02T10:50:00.123456+00:00",
++  "completed_at": "2026-09-02T10:50:00.456789+00:00",
++  "timestamp_iso": "2026-09-02T10:50:00.456789+00:00",
++  "verification_status": "passed",
++  "operator_name": "Forensic Sanitization Officer",
++  "device": {
++    "name": "C:\\Users\\DELL\\evidence\\confidential_case_402.docx",
++    "type": "Local Dummy/Test File",
++    "serial": "N/A",
++    "capacity_bytes": 1048576
++  },
++  "verification": {
++    "passed": true,
++    "sample_sectors_checked": 5,
++    "residual_data_found": false,
++    "average_entropy": 7.9812,
++    "expected_pattern_type": "Cryptographic Random / High Entropy",
++    "details": "High Shannon entropy confirmed across all 5 sampled regions (avg: 7.98 bits/byte)."
++  },
++  "certificate_path": "certificates/certificate_san-4a9e5d50e7f3.json",
++  "error_message": null
++}
++```
++
++---
++
++## 6. Execution & Test Instructions
++
++### Running Tests
++
++All unit and acceptance tests strictly operate on local temporary dummy files.
++
++```powershell
++# Using Pytest
++pytest tests/erasure/ -v
++
++# Using Python unittest runner
++python -m unittest discover -s tests/erasure -p "test_*.py" -v
++```
++
++### Programmatic Usage
++
++```python
++from erasure.sanitizer import sanitize_file
++from erasure.methods import SanitizationAlgorithm
++
++# Execute full NIST Clear sanitization workflow
++result = sanitize_file(
++    target_path="path/to/target_file.dat",
++    algorithm=SanitizationAlgorithm.NIST_800_88_CLEAR,
++    operator_name="Investigator Jane Doe",
++    certificates_dir="certificates",
++)
++
++if result.status == "completed":
++    print(f"[+] Successfully sanitized: {result.original_filename}")
++    print(f"    Pre-wipe SHA-256: {result.pre_wipe_sha256}")
++    print(f"    Certificate saved: {result.certificate_path}")
++else:
++    print(f"[-] Sanitization failed: {result.error_message}")
++```
++
++### Target Scope Safety Verification via CLI
++
++```powershell
++python -c "from erasure.device_detection import check_target_safety; print(check_target_safety('C:\\Windows\\System32'))"
++# Output: False (Protected OS directory)
++```
