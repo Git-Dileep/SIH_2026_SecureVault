@@ -30,6 +30,13 @@ from erasure.verification import (
     inspect_erasure,
     verify_erasure,
 )
+from erasure.sanitizer import (
+    SanitizationJobResult,
+    Sanitizer,
+    compute_file_sha256,
+    generate_random_filename,
+    sanitize_file,
+)
 
 __all__ = [
     # Methods
@@ -56,4 +63,10 @@ __all__ = [
     "calculate_shannon_entropy",
     "inspect_erasure",
     "verify_erasure",
+    # Sanitizer Orchestrator
+    "SanitizationJobResult",
+    "Sanitizer",
+    "compute_file_sha256",
+    "generate_random_filename",
+    "sanitize_file",
 ]
