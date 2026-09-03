@@ -37,6 +37,15 @@ from erasure.sanitizer import (
     generate_random_filename,
     sanitize_file,
 )
+from erasure.audit_trail import (
+    AuditEntry,
+    AuditTrail,
+)
+from erasure.handler import (
+    authorize,
+    handle_clear,
+    handle_purge,
+)
 
 __all__ = [
     # Methods
@@ -69,4 +78,11 @@ __all__ = [
     "compute_file_sha256",
     "generate_random_filename",
     "sanitize_file",
+    # Handler & Auth
+    "authorize",
+    "handle_clear",
+    "handle_purge",
+    # Audit Trail
+    "AuditEntry",
+    "AuditTrail",
 ]
