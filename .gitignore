@@ -47,6 +47,12 @@ Desktop.ini
 .env.*.local
 !frontend/.env
 
+# ===== Recovery runtime =====
+recovery/workspace/
+recovery/recovered/
+recovery/testdata/*.img
+recovery/__pycache__/
+
 # ===== Misc =====
 *.log
 *.tmp

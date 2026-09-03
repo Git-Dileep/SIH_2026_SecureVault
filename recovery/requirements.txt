@@ -1,0 +1,6 @@
+# ForensicRecover MVP uses the Python standard library only.
+# No third-party packages are required.
+#
+# Python 3.10+ recommended (tested with the macOS system Python 3.x).
+# Tkinter is used for the GUI and ships with most CPython installers.
+# On some Linux distros you may need: sudo apt install python3-tk

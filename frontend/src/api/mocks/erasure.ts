@@ -1,0 +1,116 @@
+import type { SanitizationResult } from '../../types';
+
+export const mockErasureJobs: SanitizationResult[] = [
+  {
+    id: 'SAN-2026-001',
+    device: {
+      name: '/dev/sda',
+      type: 'HDD',
+      serial: 'WD-WCC7K0RY4321',
+      capacity_bytes: 1_000_000_000_000,
+    },
+    method: 'purge',
+    passes_completed: 3,
+    passes_total: 3,
+    status: 'completed',
+    started_at: '2026-08-27T08:00:00Z',
+    completed_at: '2026-08-27T14:35:00Z',
+    verification: {
+      passed: true,
+      sample_sectors_checked: 50000,
+      residual_data_found: false,
+    },
+    certificate_url: '/certificates/SAN-2026-001.pdf',
+  },
+  {
+    id: 'SAN-2026-002',
+    device: {
+      name: '/dev/nvme0n1',
+      type: 'NVMe',
+      serial: 'SAMSUNG-MZQL21T9HCJR-00A07',
+      capacity_bytes: 2_000_000_000_000,
+    },
+    method: 'purge',
+    passes_completed: 1,
+    passes_total: 1,
+    status: 'verifying',
+    started_at: '2026-08-30T10:00:00Z',
+    completed_at: null,
+    verification: {
+      passed: false,
+      sample_sectors_checked: 12000,
+      residual_data_found: false,
+    },
+    certificate_url: null,
+  },
+  {
+    id: 'SAN-2026-003',
+    device: {
+      name: '/dev/sdb',
+      type: 'USB',
+      serial: 'KINGSTON-DT100G3-9876',
+      capacity_bytes: 64_000_000_000,
+    },
+    method: 'clear',
+    passes_completed: 1,
+    passes_total: 1,
+    status: 'completed',
+    started_at: '2026-08-29T16:00:00Z',
+    completed_at: '2026-08-29T16:45:00Z',
+    verification: {
+      passed: true,
+      sample_sectors_checked: 10000,
+      residual_data_found: false,
+    },
+    certificate_url: '/certificates/SAN-2026-003.pdf',
+  },
+  {
+    id: 'SAN-2026-004',
+    device: {
+      name: '/dev/sdc',
+      type: 'SSD',
+      serial: 'CRUCIAL-CT500MX-5432',
+      capacity_bytes: 500_000_000_000,
+    },
+    method: 'purge',
+    passes_completed: 2,
+    passes_total: 3,
+    status: 'in_progress',
+    started_at: '2026-08-31T09:30:00Z',
+    completed_at: null,
+    verification: {
+      passed: false,
+      sample_sectors_checked: 0,
+      residual_data_found: false,
+    },
+    certificate_url: null,
+  },
+  {
+    id: 'SAN-2026-005',
+    device: {
+      name: '/dev/sdd',
+      type: 'HDD',
+      serial: 'SEAGATE-ST2000DM-7654',
+      capacity_bytes: 2_000_000_000_000,
+    },
+    method: 'destroy',
+    passes_completed: 0,
+    passes_total: 0,
+    status: 'pending',
+    started_at: '2026-09-01T08:00:00Z',
+    completed_at: null,
+    verification: {
+      passed: false,
+      sample_sectors_checked: 0,
+      residual_data_found: false,
+    },
+    certificate_url: null,
+  },
+];
+
+export const mockDevices = [
+  { name: '/dev/sda', type: 'HDD' as const, serial: 'WD-WCC7K0RY4321', capacity_bytes: 1_000_000_000_000 },
+  { name: '/dev/nvme0n1', type: 'NVMe' as const, serial: 'SAMSUNG-MZQL21T9HCJR', capacity_bytes: 2_000_000_000_000 },
+  { name: '/dev/sdb', type: 'USB' as const, serial: 'KINGSTON-DT100G3-9876', capacity_bytes: 64_000_000_000 },
+  { name: '/dev/sdc', type: 'SSD' as const, serial: 'CRUCIAL-CT500MX-5432', capacity_bytes: 500_000_000_000 },
+];

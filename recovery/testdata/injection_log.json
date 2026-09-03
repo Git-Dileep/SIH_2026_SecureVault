@@ -1,0 +1,100 @@
+{
+  "created_at": "2026-09-03T09:04:28Z",
+  "image_path": "testdata/synthetic_disk.img",
+  "image_size_bytes": 104857600,
+  "image_sha256": "530e04878c06a74b75871d74009400979545476c215d3a0df9331d41819777d0",
+  "fill": "0x00",
+  "how_label_is_generated": "Each planted file is a contiguous byte run at a known offset. There is no filesystem. A correct carver must report the same type, start offset, and SHA-256 as this log.",
+  "files": [
+    {
+      "id": 1,
+      "type": "JPEG",
+      "source_file": "samples/photo_scene.jpg",
+      "offset_start": 1048576,
+      "offset_end": 1050293,
+      "size": 1717,
+      "sha256": "f2c4e25e85cb66646a6767edc5f4772ce69a4e0a5cfa788fbecab13a0a2172a8"
+    },
+    {
+      "id": 2,
+      "type": "PNG",
+      "source_file": "samples/badge_red.png",
+      "offset_start": 3145728,
+      "offset_end": 3145943,
+      "size": 215,
+      "sha256": "5df733ae26d052ba7a8c94118f625530a642207998db1392af4453054cd7d6ad"
+    },
+    {
+      "id": 3,
+      "type": "PDF",
+      "source_file": "samples/case_summary.pdf",
+      "offset_start": 5767168,
+      "offset_end": 5767958,
+      "size": 790,
+      "sha256": "6ac59a7348e3e3946fb385deeb23d90b520c90d4313fd228fe95da2ef3ad73c9"
+    },
+    {
+      "id": 4,
+      "type": "ZIP",
+      "source_file": "samples/notes.zip",
+      "offset_start": 8388608,
+      "offset_end": 8388925,
+      "size": 317,
+      "sha256": "1e7689189ce14bdca5596c8b35d35a01a6574c9bcc4653a5d54b53df28b0cc95"
+    },
+    {
+      "id": 5,
+      "type": "JPEG",
+      "source_file": "samples/photo_id.jpg",
+      "offset_start": 11534336,
+      "offset_end": 11536171,
+      "size": 1835,
+      "sha256": "9ba91b61ce60d75ca4210fecc85e14fc77eedb4428f464a0642cf5ee0ddbd240"
+    },
+    {
+      "id": 6,
+      "type": "PNG",
+      "source_file": "samples/chart_blue.png",
+      "offset_start": 14680064,
+      "offset_end": 14680331,
+      "size": 267,
+      "sha256": "e537bc2f6c0d8b63e2d0942ad9c37031ebae0ef235e223c3d52d6e86f891c306"
+    },
+    {
+      "id": 7,
+      "type": "PDF",
+      "source_file": "samples/chain_of_custody.pdf",
+      "offset_start": 18874368,
+      "offset_end": 18875109,
+      "size": 741,
+      "sha256": "62c00ac5e55cef81c9453ac0d4f2844d24c675cd4180b061f05b2c87264d15ca"
+    },
+    {
+      "id": 8,
+      "type": "ZIP",
+      "source_file": "samples/exports.zip",
+      "offset_start": 23068672,
+      "offset_end": 23068944,
+      "size": 272,
+      "sha256": "57627cc7c4ad7c3f954eb269dc3ae202a6944a4cec5e9ba1754a92e1fc9c2c0a"
+    },
+    {
+      "id": 9,
+      "type": "JPEG",
+      "source_file": "samples/photo_lab.jpg",
+      "offset_start": 27262976,
+      "offset_end": 27264169,
+      "size": 1193,
+      "sha256": "b2babe0062d510cd94a6dfbab82484368109d4f1104ec82a2736cb397dfd598d"
+    },
+    {
+      "id": 10,
+      "type": "PNG",
+      "source_file": "samples/logo_green.png",
+      "offset_start": 31457280,
+      "offset_end": 31457444,
+      "size": 164,
+      "sha256": "cba152fb6a26041cf27052662f7122fc2e4f36c542e2e312aa97864e16fd3265"
+    }
+  ]
+}

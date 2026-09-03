@@ -67,20 +67,29 @@ npm install
 npm run dev
 ```
 
-### Running the Frontend (Dev)
+### Running locally (recovery backend + frontend)
+
+The recovery engine lives in `recovery/` (from `file-recov`). The React console lives in `frontend/`.
 
 ```bash
+# terminal 1 — Python API
+cd recovery
+python3 generate_test_image.py    # once: builds testdata/synthetic_disk.img
+python3 server.py                 # http://127.0.0.1:8000
+
+# terminal 2 — web UI
 cd frontend
-npm run dev
-# Runs on http://localhost:5173 with mock data by default
+npm install
+npm run dev                       # http://localhost:5173
 ```
 
-To switch from mock data to real API:
+`frontend/.env` already has `VITE_USE_MOCKS=false` and `VITE_API_BASE_URL=/api/v1`. Vite proxies `/api` to the recovery server.
+
+CLI / GUI (from `recovery/`):
 
 ```bash
-# In frontend/.env, change:
-VITE_USE_MOCKS=false
-VITE_API_BASE_URL=http://localhost:8000
+python3 main.py testdata/synthetic_disk.img recovered/
+python3 gui.py
 ```
 
 ---
