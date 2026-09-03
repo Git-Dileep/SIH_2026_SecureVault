@@ -5,6 +5,9 @@ import EvidenceImport from './pages/EvidenceImport';
 import RecoveryResults from './pages/RecoveryResults';
 import ErasureFlow from './pages/ErasureFlow';
 import AuditLog from './pages/AuditLog';
+import Reports from './pages/Reports';
+import Settings from './pages/Settings';
+import NotFound from './pages/NotFound';
 
 export default function App() {
   return (
@@ -16,6 +19,9 @@ export default function App() {
           <Route path="/recovery/results" element={<RecoveryResults />} />
           <Route path="/erasure" element={<ErasureFlow />} />
           <Route path="/audit" element={<AuditLog />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<NotFound />} />
         </Route>
       </Routes>
     </BrowserRouter>

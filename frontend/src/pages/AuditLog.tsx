@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import type { AuditLogEntry, AuditAction } from '../types';
 import { getAuditLog } from '../api/audit';
 import PageHeader from '../components/PageHeader';
@@ -17,30 +17,35 @@ const ACTION_OPTIONS: { value: AuditAction | ''; label: string }[] = [
 ];
 
 export default function AuditLog() {
-  const [entries, setEntries] = useState<AuditLogEntry[]>([]);
+  const [allEntries, setAllEntries] = useState<AuditLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterAction, setFilterAction] = useState('');
 
-  const fetchLog = useCallback(() => {
-    setLoading(true);
-    getAuditLog({
-      action: filterAction || undefined,
-    })
-      .then((data) => {
-        // Sort chronologically for timeline (oldest first)
-        const sorted = [...data].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-        setEntries(sorted);
-      })
-      .finally(() => setLoading(false));
-  }, [filterAction]);
-
   useEffect(() => {
-    fetchLog();
-  }, [fetchLog]);
+    let cancelled = false;
+    getAuditLog()
+      .then((data) => {
+        if (cancelled) return;
+        const sorted = [...data].sort(
+          (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+        );
+        setAllEntries(sorted);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-  const isValidChain = entries.length > 0 && entries.every((entry, idx) => {
+  const entries = filterAction
+    ? allEntries.filter((entry) => entry.action === filterAction)
+    : allEntries;
+
+  const isValidChain = allEntries.length > 0 && allEntries.every((entry, idx) => {
     if (idx === 0) return true;
-    return entries[idx - 1].entry_hash === entry.prev_hash;
+    return allEntries[idx - 1].entry_hash === entry.prev_hash;
   });
 
   return (

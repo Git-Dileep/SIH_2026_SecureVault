@@ -21,6 +21,10 @@
   --color-text-primary: #F1F1EC;
   --color-text-secondary: #A1A19A;
   --color-text-muted: #73736E;
+  /* Aliases so text-primary / text-secondary / text-muted utilities work */
+  --color-primary: #F1F1EC;
+  --color-secondary: #A1A19A;
+  --color-muted: #73736E;
 
   /* Accent */
   --color-accent: #8F3030;
@@ -335,4 +339,13 @@ select.input {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
 }

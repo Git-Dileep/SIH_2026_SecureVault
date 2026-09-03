@@ -79,10 +79,10 @@ export default function Sidebar() {
             </h2>
             <div className="flex flex-col gap-0.5">
               {section.items.map((item) => {
-                // simple active matching
-                const isActive = item.path.split('#')[0] === '/' 
-                  ? location.pathname === '/' 
-                  : location.pathname.startsWith(item.path.split('#')[0]);
+                const current = `${location.pathname}${location.hash}`;
+                const isActive = item.path === '/'
+                  ? location.pathname === '/' && location.hash === ''
+                  : current === item.path;
                 
                 const Icon = item.icon;
 
@@ -108,8 +108,8 @@ export default function Sidebar() {
       
       {/* Footer */}
       <div className="px-6 py-4 border-t text-[11px] font-mono text-muted" style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
-        v2.4.1 (Stable)<br/>
-        User: Admin
+        ForensicRecover 1.0.0-mvp<br/>
+        local-operator
       </div>
     </aside>
   );

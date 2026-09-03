@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { SanitizationResult, SanitizationDevice, SanitizationMethod } from '../types';
 import { getErasureJobs, getDevices, startErasure } from '../api/erasure';
+import { apiAssetUrl } from '../api/client';
 import PageHeader from '../components/PageHeader';
 import { SanitizationStatusBadge } from '../components/StatusBadge';
 
@@ -38,6 +39,7 @@ export default function ErasureFlow() {
   const [selectedDevice, setSelectedDevice] = useState<string>('');
   const [selectedMethod, setSelectedMethod] = useState<SanitizationMethod>('clear');
   const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([getDevices(), getErasureJobs()])
@@ -46,15 +48,24 @@ export default function ErasureFlow() {
         setJobs(jbs);
         if (devs.length > 0) setSelectedDevice(devs[0].name);
       })
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : 'Failed to load erasure module');
+      })
       .finally(() => setLoading(false));
   }, []);
 
   const handleStart = async () => {
     if (!selectedDevice || !selectedMethod) return;
     setStarting(true);
-    const job = await startErasure(selectedDevice, selectedMethod);
-    setJobs((prev) => [job, ...prev]);
-    setStarting(false);
+    setError(null);
+    try {
+      const job = await startErasure(selectedDevice, selectedMethod);
+      setJobs((prev) => [job, ...prev.filter((item) => item.id !== job.id)]);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Erasure failed');
+    } finally {
+      setStarting(false);
+    }
   };
 
   if (loading) {
@@ -63,7 +74,12 @@ export default function ErasureFlow() {
 
   return (
     <>
-      <PageHeader title="Media Sanitization" subtitle="NIST SP 800-88 compliant secure erasure" />
+      <PageHeader title="Media Sanitization" subtitle="Copy-only demo: hash → overwrite a COPY → verify. Original files are never touched." />
+      {error && (
+        <div className="mb-4 p-3 text-[13px] border rounded" style={{ borderColor: 'var(--color-danger)', color: 'var(--color-danger)' }}>
+          {error}
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-6 mb-8">
         {/* New Job Form */}
@@ -74,7 +90,7 @@ export default function ErasureFlow() {
           
           <div className="flex flex-col gap-4 flex-1">
             <div>
-              <label className="block text-[11px] uppercase tracking-wider text-muted mb-2">Target Device</label>
+              <label className="block text-[11px] uppercase tracking-wider text-muted mb-2">Target file (copy only)</label>
               <select 
                 className="input" 
                 value={selectedDevice} 
@@ -105,7 +121,7 @@ export default function ErasureFlow() {
             <div className="mt-auto pt-6">
               <div className="p-3 mb-4 rounded border" style={{ background: 'var(--color-danger-muted)', borderColor: 'var(--color-danger)', color: 'var(--color-text-primary)' }}>
                 <div className="text-[11px] font-bold uppercase mb-1">Warning</div>
-                <div className="text-[12px]">This action is irreversible. Data will be permanently destroyed.</div>
+                <div className="text-[12px]">A working COPY is overwritten. The original sample file stays intact. Device nodes are refused.</div>
               </div>
               <button 
                 className="btn btn-danger w-full justify-center mono tracking-wider" 
@@ -164,7 +180,7 @@ export default function ErasureFlow() {
                               {job.verification.passed ? 'VERIFIED' : 'FAILED'}
                             </span>
                             {job.certificate_url && (
-                              <a href="#" className="mono text-[11px] text-accent hover:underline">CERTIFICATE.PDF</a>
+                              <a href={apiAssetUrl(job.certificate_url)} className="mono text-[11px] text-accent hover:underline" target="_blank" rel="noreferrer">CERTIFICATE.PDF</a>
                             )}
                           </div>
                         ) : (

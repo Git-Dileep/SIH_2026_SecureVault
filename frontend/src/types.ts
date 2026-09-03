@@ -99,11 +99,26 @@ export interface AuditLogEntry {
 
 // ===== API Response wrappers =====
 
+export type RecoverySessionStatus = 'idle' | 'running' | 'completed' | 'failed';
+
 export interface RecoveryResultsResponse {
   session_id: string;
   evidence_id: string;
   total_files: number;
   files: RecoveredFile[];
+  status?: RecoverySessionStatus;
+  progress?: number;
+  message?: string;
+  image_size_bytes?: number;
+}
+
+export interface RecoverySessionSummary {
+  session_id: string;
+  evidence_id: string;
+  status: RecoverySessionStatus;
+  progress: number;
+  message: string;
+  total_files: number;
 }
 
 export interface DashboardStats {
@@ -115,4 +130,12 @@ export interface DashboardStats {
   recovery_by_type: { type: string; count: number }[];
   recent_activity: AuditLogEntry[];
   confidence_distribution: { label: string; count: number }[];
+  sessions?: RecoverySessionSummary[];
+}
+
+export interface HealthStatus {
+  ok: boolean;
+  tool: string;
+  version: string;
+  mocks?: boolean;
 }

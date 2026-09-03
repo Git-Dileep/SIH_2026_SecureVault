@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router';
 import {
   FileText,
   ChevronDown,
@@ -6,6 +7,7 @@ import {
 } from 'lucide-react';
 import type { RecoveredFile, RecoveryResultsResponse } from '../types';
 import { getRecoveryResults } from '../api/recovery';
+import { fileUrl, reportUrl } from '../api/client';
 import PageHeader from '../components/PageHeader';
 
 function formatBytes(bytes: number): string {
@@ -105,6 +107,21 @@ function FileRow({ file }: { file: RecoveredFile }) {
                   <p className="text-[12px] leading-relaxed border-l-2 pl-3" style={{ borderColor: 'var(--color-border)' }}>
                     {file.ai_explanation}
                   </p>
+                  {(file.file_type === 'JPEG' || file.file_type === 'PNG') && (
+                    <img
+                      src={fileUrl(file.evidence_id, file.filename)}
+                      alt={file.filename}
+                      className="mt-4 max-h-40 border"
+                      style={{ borderColor: 'var(--color-border)' }}
+                    />
+                  )}
+                  <a
+                    href={fileUrl(file.evidence_id, file.filename)}
+                    className="inline-block mt-3 text-[12px] mono text-accent hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    DOWNLOAD FILE
+                  </a>
                 </div>
               </div>
             </div>
@@ -118,15 +135,60 @@ function FileRow({ file }: { file: RecoveredFile }) {
 export default function RecoveryResults() {
   const [data, setData] = useState<RecoveryResultsResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getRecoveryResults()
-      .then(setData)
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    const tick = () =>
+      getRecoveryResults()
+        .then((result) => {
+          if (!cancelled) setData(result);
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load recovery results');
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+
+    void tick();
+    const timer = window.setInterval(() => {
+      if (cancelled) return;
+      void getRecoveryResults()
+        .then((result) => {
+          if (cancelled) return;
+          setData(result);
+          if (result.status && result.status !== 'running') {
+            window.clearInterval(timer);
+          }
+        })
+        .catch(() => undefined);
+    }, 800);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
-  if (loading || !data) {
+  if (loading) {
     return <div className="p-8 text-[13px] text-muted">Loading results...</div>;
+  }
+
+  if (error) {
+    return <div className="p-8 text-[13px] text-danger">{error}</div>;
+  }
+
+  if (!data || data.status === 'idle' || !data.session_id) {
+    return (
+      <>
+        <PageHeader title="Recovery Operations" subtitle="No carving session yet" />
+        <div className="card max-w-[560px]">
+          <p className="text-[13px] mb-4">Import a raw disk image to run the signature carver.</p>
+          <Link to="/import" className="btn btn-primary no-underline">Open evidence import</Link>
+        </div>
+      </>
+    );
   }
 
   const high = data.files.filter((f) => f.confidence_label === 'high').length;
@@ -135,28 +197,46 @@ export default function RecoveryResults() {
 
   return (
     <>
-      <PageHeader title="Recovery Operations" subtitle={`Session: ${data.session_id} • Target: ${data.evidence_id}`} />
+      <PageHeader
+        title="Recovery Operations"
+        subtitle={`Session: ${data.session_id} • Target: ${data.evidence_id}${data.message ? ` • ${data.message}` : ''}`}
+        actions={
+          data.evidence_id ? (
+            <a
+              className="btn btn-secondary mono text-[12px] no-underline"
+              href={reportUrl(data.evidence_id, 'html')}
+              target="_blank"
+              rel="noreferrer"
+            >
+              HTML REPORT
+            </a>
+          ) : null
+        }
+      />
 
       {/* Process Tracker */}
       <div className="card mb-8 p-6">
         <div className="flex justify-between items-center mb-2">
-          {['01 Evidence', '02 Scan', '03 Extract', '04 Analyse', '05 Report'].map((step, idx) => (
+          {['01 Evidence', '02 Scan', '03 Extract', '04 Analyse', '05 Report'].map((step, idx) => {
+            const doneSteps = data.status === 'completed' ? 5 : data.status === 'running' ? Math.min(4, Math.floor((data.progress ?? 0) * 5)) : 0;
+            return (
             <div key={step} className="flex-1 flex flex-col gap-2">
-              <span className={`text-[11px] font-mono uppercase tracking-wider ${idx <= 3 ? 'text-primary' : 'text-muted'}`}>
+              <span className={`text-[11px] font-mono uppercase tracking-wider ${idx < doneSteps ? 'text-primary' : 'text-muted'}`}>
                 {step}
               </span>
-              <div className="h-1 mr-2" style={{ background: idx < 3 ? 'var(--color-success)' : idx === 3 ? 'var(--color-accent)' : 'var(--color-border)' }} />
+              <div className="h-1 mr-2" style={{ background: idx < doneSteps - 1 ? 'var(--color-success)' : idx === doneSteps - 1 ? 'var(--color-accent)' : 'var(--color-border)' }} />
             </div>
-          ))}
+            );
+          })}
         </div>
         <div className="mt-6 grid grid-cols-6 gap-4 border-t pt-4" style={{ borderColor: 'var(--color-border)' }}>
           <div>
             <div className="text-[11px] uppercase tracking-wider text-muted mb-1">Sectors</div>
-            <div className="mono text-[14px]">48.2M</div>
+            <div className="mono text-[14px]">{data.image_size_bytes ? Math.round(data.image_size_bytes / 512).toLocaleString() : '—'}</div>
           </div>
           <div>
             <div className="text-[11px] uppercase tracking-wider text-muted mb-1">Detected</div>
-            <div className="mono text-[14px]">1,402</div>
+            <div className="mono text-[14px]">{data.total_files}</div>
           </div>
           <div>
             <div className="text-[11px] uppercase tracking-wider text-muted mb-1">Recovered</div>
@@ -178,7 +258,7 @@ export default function RecoveryResults() {
       </div>
 
       {/* Results table */}
-      <div className="card p-0 overflow-hidden">
+      <div id="files" className="card p-0 overflow-hidden">
         <div className="p-4 border-b flex justify-between items-center" style={{ borderColor: 'var(--color-border)' }}>
           <h3 className="text-[13px] font-medium uppercase tracking-wider text-muted">Recovered Files Analysis</h3>
         </div>
