@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router';
-import { Database, FileSearch, ShieldCheck, ScrollText } from 'lucide-react';
+import { Database, FileSearch, ShieldCheck, ScrollText, Brain, Link2 } from 'lucide-react';
 import type { DashboardStats, Evidence } from '../types';
 import { getDashboardStats, getEvidenceList, importEvidence } from '../api/recovery';
 import PageHeader from '../components/PageHeader';
@@ -69,11 +69,19 @@ export default function Dashboard() {
     <>
       <PageHeader
         title="Overview"
-        subtitle="Live ForensicRecover carver and copy-only erasure demo"
+        subtitle="SSD-aware NIST purge · AI fragment classifier · blockchain chain-of-custody"
         actions={
-          <button className="btn btn-primary mono text-[12px]" disabled={seeding} onClick={() => void loadDemo()}>
-            {seeding ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
-          </button>
+          <div className="flex gap-2">
+            <Link to="/demo/delete-recover" className="btn btn-secondary mono text-[12px] no-underline">
+              DELETE → RECOVER
+            </Link>
+            <Link to="/audit/chain" className="btn btn-secondary mono text-[12px] no-underline">
+              CUSTODY CHAIN
+            </Link>
+            <button className="btn btn-primary mono text-[12px]" disabled={seeding} onClick={() => void loadDemo()}>
+              {seeding ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
+            </button>
+          </div>
         }
       />
       {error && (
@@ -81,6 +89,30 @@ export default function Dashboard() {
           {error}
         </div>
       )}
+
+      <div className="grid grid-cols-3 gap-4 mb-6">
+        <Link to="/erasure" className="card no-underline hover:opacity-90">
+          <div className="flex items-center gap-2 text-[12px] text-muted uppercase tracking-wider mb-2">
+            <ShieldCheck size={14} /> SSD-aware erasure
+          </div>
+          <div className="text-[15px] text-primary mb-1">NIST 800-88 Rev. 2 Purge</div>
+          <p className="text-[12px]">HDD gets DoD 7-pass. SSD/NVMe get firmware-level erase so overprovisioned NAND is not left behind.</p>
+        </Link>
+        <Link to="/ai" className="card no-underline hover:opacity-90">
+          <div className="flex items-center gap-2 text-[12px] text-muted uppercase tracking-wider mb-2">
+            <Brain size={14} /> AI fragment classifier
+          </div>
+          <div className="text-[15px] text-primary mb-1">512-byte type ID</div>
+          <p className="text-[12px]">When signatures miss, an MLP on entropy + histograms recovers jpg/png/pdf/zip/docx/xlsx/mp4/mp3/txt/exe at ≥0.70 confidence.</p>
+        </Link>
+        <Link to="/audit" className="card no-underline hover:opacity-90">
+          <div className="flex items-center gap-2 text-[12px] text-muted uppercase tracking-wider mb-2">
+            <Link2 size={14} /> Blockchain audit
+          </div>
+          <div className="text-[15px] text-primary mb-1">Merkle-sealed ledger</div>
+          <p className="text-[12px]">Every import, carve, and purge is a block. Verify the chain and optionally anchor the tip hash.</p>
+        </Link>
+      </div>
 
       {/* Compact Stat Cards */}
       <div className="grid grid-cols-4 gap-4 mb-6">

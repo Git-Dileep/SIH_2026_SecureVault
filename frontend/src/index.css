@@ -349,3 +349,400 @@ select.input {
 .animate-fade-in {
   animation: fade-in 0.25s ease-out;
 }
+
+/* ===== Drive type badges ===== */
+
+.drive-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+
+.drive-badge-hdd {
+  background: #1b3a55;
+  color: #7eb6e0;
+  border-color: #4a7a9e;
+}
+
+.drive-badge-ssd {
+  background: var(--color-success-muted);
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.drive-badge-nvme {
+  background: #3a2754;
+  color: #c4a0e8;
+  border-color: #7b5ea7;
+}
+
+.drive-badge-usb {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-secondary);
+  border-color: var(--color-border-subtle);
+}
+
+/* ===== AI confidence bars ===== */
+
+.confidence-bar {
+  min-width: 120px;
+}
+
+.confidence-track {
+  height: 6px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+
+.confidence-fill {
+  height: 100%;
+  transition: width 0.25s ease;
+}
+
+.confidence-high { background: var(--color-success); }
+.confidence-medium { background: var(--color-warning); }
+.confidence-low { background: var(--color-danger); }
+
+.ai-badge {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  background: var(--color-info-muted);
+  color: var(--color-info);
+  border: 1px solid var(--color-info);
+  border-radius: 3px;
+}
+
+/* ===== Blockchain explorer ===== */
+
+.chain-diagram {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+}
+
+.chain-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.chain-block {
+  width: 160px;
+  text-align: left;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 10px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.chain-block:hover,
+.chain-block.is-selected {
+  border-color: var(--color-accent);
+}
+
+.chain-arrow {
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: 18px;
+}
+
+/* ===== NIST certificate ===== */
+
+.certificate-frame {
+  background: var(--color-bg-surface);
+  border: 2px solid #8a7a4a;
+  box-shadow: inset 0 0 0 4px var(--color-bg-elevated);
+  border-radius: 4px;
+  padding: 24px;
+}
+
+.certificate-embed {
+  width: 100%;
+  min-height: 420px;
+  border: 1px solid var(--color-border);
+  background: #111;
+}
+
+/* ===== Feature navbar ===== */
+
+.feature-nav {
+  display: flex;
+  gap: 8px;
+  padding: 12px 32px 0;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+}
+
+.feature-nav-link {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--color-text-muted);
+  border-bottom: 2px solid transparent;
+}
+
+.feature-nav-link:hover,
+.feature-nav-link.is-active {
+  color: var(--color-text-primary);
+  border-bottom-color: var(--color-accent);
+}
+
+.upload-zone.is-over {
+  border-color: var(--color-text-secondary);
+  background: var(--color-bg-surface-hover);
+}
+
+.lab-banner {
+  padding: 8px 32px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--color-warning-muted);
+  color: var(--color-warning);
+  border-bottom: 1px solid var(--color-warning);
+}
+
+.demo-steps {
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex-wrap: wrap;
+}
+
+.demo-steps li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.demo-steps li span {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.demo-steps li.is-current {
+  border-color: var(--color-accent);
+  color: var(--color-text-primary);
+}
+
+.demo-steps li.is-done {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-elevated);
+}
+
+/* ===== Login ===== */
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(280px, 42%) 1fr;
+  background: var(--color-bg-primary);
+}
+
+.login-brand {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 48px 44px;
+  background:
+    radial-gradient(1200px 500px at -10% -20%, #5c2323 0%, transparent 55%),
+    linear-gradient(180deg, #1a1212 0%, var(--color-bg-primary) 100%);
+  border-right: 1px solid var(--color-border);
+}
+
+.login-brand-mark {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-accent);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-radius: 6px;
+}
+
+.login-brand-mark-sm {
+  width: 32px;
+  height: 32px;
+  font-size: 11px;
+  display: none;
+}
+
+.login-kicker {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin-bottom: 12px;
+}
+
+.login-brand-title {
+  font-size: 32px;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  max-width: 14ch;
+}
+
+.login-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+}
+
+.login-card-head {
+  margin-bottom: 28px;
+}
+
+.login-card-head h2 {
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  margin-bottom: 8px;
+}
+
+.login-card-head p {
+  font-size: 14px;
+  color: var(--color-text-secondary);
+}
+
+.login-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  margin-bottom: 24px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--color-bg-surface);
+}
+
+.login-tabs button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+.login-tabs button + button {
+  border-left: 1px solid var(--color-border);
+}
+
+.login-tabs button:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-surface-hover);
+}
+
+.login-tabs button.is-active {
+  background: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+}
+
+.login-error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  font-size: 13px;
+  border: 1px solid var(--color-danger);
+  border-radius: 4px;
+  color: var(--color-danger);
+  background: var(--color-danger-muted);
+}
+
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.login-field span {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+}
+
+.login-field .input {
+  height: 42px;
+  padding: 0 12px;
+  font-size: 14px;
+}
+
+.login-submit {
+  width: 100%;
+  height: 42px;
+  margin-top: 8px;
+  font-size: 14px;
+}
+
+@media (max-width: 860px) {
+  .login-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .login-brand {
+    display: none;
+  }
+
+  .login-brand-mark-sm {
+    display: flex;
+    margin-bottom: 16px;
+  }
+
+  .login-panel {
+    min-height: 100vh;
+    padding: 32px 20px;
+  }
+}

@@ -1,6 +1,16 @@
-# ForensicRecover MVP uses the Python standard library only.
-# No third-party packages are required.
+# ForensicRecover uses the Python standard library for carving, hashing,
+# the HTTP API, and NIST PDF certificates.
+#
+# Optional (AI fragment classifier training / torch CNN export):
+#   numpy>=1.24.0
+#   torch>=2.0.0
+#
+# Inference of the 512-byte fragment MLP does NOT require numpy or torch.
+# Weights live in recovery/ai/models/fragment_classifier.pth (and .json).
 #
 # Python 3.10+ recommended (tested with the macOS system Python 3.x).
 # Tkinter is used for the GUI and ships with most CPython installers.
 # On some Linux distros you may need: sudo apt install python3-tk
+#
+# numpy>=1.24.0
+# torch>=2.0.0

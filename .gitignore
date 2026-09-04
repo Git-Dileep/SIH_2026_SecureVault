@@ -53,6 +53,11 @@ recovery/recovered/
 recovery/testdata/*.img
 recovery/__pycache__/
 
+# ===== Audit runtime =====
+audit/audit_chain.json
+audit/audit_chain.json.tmp
+audit/audit.log
+
 # ===== Misc =====
 *.log
 *.tmp

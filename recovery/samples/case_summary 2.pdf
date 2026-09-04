@@ -1,0 +1,26 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length 240 >> stream
+BT /F1 16 Tf 72 720 Td (Case 2026-SIH-01 ? Summary) Tj
+0 -22 Td (Suspect workstation seized 2026-03-12.) Tj
+0 -22 Td (Raw image acquired with write-blocker \(mock\).) Tj
+0 -22 Td (This PDF is planted inside the synthetic disk image.) Tj
+ET
+endstream
+endobj
+5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000537 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+607
+%%EOF
