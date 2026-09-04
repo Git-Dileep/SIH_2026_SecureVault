@@ -17,6 +17,7 @@ import hashlib
 import mmap
 import os
 import struct
+import sys
 import zlib
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -60,12 +61,28 @@ class RecoveredFile:
     confidence: str            # high | medium | low
     sha256: str
     notes: str = ""
+    ai_confidence: float | None = None
+    entropy: float | None = None
+    recovery_method: str = "signature"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 ProgressCallback = Optional[Callable[[str, float], None]]
+
+
+def _chain_log(action: str, details: dict) -> None:
+    """Best-effort forensic blockchain write. Never fails a carve."""
+    try:
+        audit_dir = Path(__file__).resolve().parent.parent / "audit"
+        if str(audit_dir) not in sys.path:
+            sys.path.insert(0, str(audit_dir))
+        from blockchain_logger import log_event
+
+        log_event(action, details)
+    except Exception:
+        return
 
 
 # File types we know how to carve. Sizes are generous for a demo image
@@ -368,10 +385,119 @@ def _overlaps(start: int, end: int, ranges: list[tuple[int, int, str]], same_typ
     return False
 
 
+def _ai_scan_unclaimed(
+    data,
+    claimed: list[tuple[int, int, str]],
+    out_dir: Path,
+    recovered: list[RecoveredFile],
+    progress_cb: ProgressCallback = None,
+) -> None:
+    """
+    When signature matching misses a fragment (no header), classify 512-byte
+    windows with the MLP and keep predictions at confidence >= 0.70.
+    """
+    try:
+        from ai.fragment_classifier import MIN_CONFIDENCE, classify_fragment
+        from ai.confidence import label_for
+        from ai.explanation import explain
+    except Exception:
+        return
+
+    image_size = len(data)
+    stride = 4096
+    max_ai = 40
+    added = 0
+    if progress_cb:
+        progress_cb("AI fragment classifier scanning unclaimed regions...", 0.92)
+
+    def claimed_at(pos: int) -> bool:
+        for start, end, _typ in claimed:
+            if start <= pos < end:
+                return True
+        return False
+
+    pos = 0
+    while pos + 512 <= image_size and added < max_ai and len(recovered) < MAX_RECOVERED_FILES:
+        if claimed_at(pos):
+            pos += stride
+            continue
+        window = bytes(data[pos : pos + 512])
+        if window.count(0) >= 460:
+            pos += stride
+            continue
+        result = classify_fragment(window)
+        if result.below_threshold or result.confidence < MIN_CONFIDENCE:
+            pos += stride
+            continue
+        if result.file_type == "unknown":
+            pos += stride
+            continue
+
+        # Expand to the surrounding non-zero run, capped per type.
+        start = pos
+        while start > 0 and not claimed_at(start - 1) and data[start - 1] != 0:
+            start -= 1
+            if pos - start > 64 * 1024:
+                break
+        end = pos + 512
+        cap = 256 * 1024
+        while end < image_size and not claimed_at(end) and data[end] != 0 and (end - start) < cap:
+            end += 1
+        if end - start < 32:
+            pos += stride
+            continue
+        if _overlaps(start, end, claimed, result.display_type):
+            pos += stride
+            continue
+
+        payload = bytes(data[start:end])
+        file_index = len(recovered) + 1
+        ext = result.file_type if result.file_type != "jpg" else "jpg"
+        filename = f"{file_index:04d}_AI_{result.display_type}_{start:08x}.{ext}"
+        dest = out_dir / filename
+        dest.write_bytes(payload)
+        notes = explain(result.to_dict())
+        rec = RecoveredFile(
+            index=file_index,
+            filename=filename,
+            type=result.display_type,
+            extension=ext,
+            offset_start=start,
+            offset_end=end,
+            size=len(payload),
+            confidence=label_for(result.confidence),
+            sha256=sha256_bytes(payload),
+            notes=notes,
+            ai_confidence=result.confidence,
+            entropy=result.entropy,
+            recovery_method="ai_classified",
+        )
+        recovered.append(rec)
+        claimed.append((start, end, result.display_type))
+        _chain_log(
+            "FILE_EXTRACTED",
+            {
+                "filename": filename,
+                "type": result.display_type,
+                "offset": start,
+                "size": len(payload),
+                "sha256": rec.sha256,
+                "method": "ai_classified",
+                "confidence": result.confidence,
+            },
+        )
+        added += 1
+        pos = end
+
+    if progress_cb:
+        progress_cb(f"AI classifier recovered {added} additional fragment(s).", 0.98)
+
+
 def carve_image(
     image_path: str | Path,
     out_dir: str | Path,
     progress_cb: ProgressCallback = None,
+    use_ai: bool = True,
 ) -> list[RecoveredFile]:
     """
     Scan `image_path` for known file signatures and write recovered files
@@ -395,6 +521,10 @@ def carve_image(
     handle, view = _open_readonly_view(image_path)
     recovered: list[RecoveredFile] = []
     claimed_ranges: list[tuple[int, int, str]] = []
+    _chain_log(
+        "RECOVERY_STARTED",
+        {"image": str(image_path), "out_dir": str(out_dir), "use_ai": use_ai},
+    )
 
     try:
         data = view  # bytes-like
@@ -436,6 +566,17 @@ def carve_image(
                 )
                 recovered.append(rec)
                 claimed_ranges.append((pos, end, sig.name))
+                _chain_log(
+                    "FILE_EXTRACTED",
+                    {
+                        "filename": filename,
+                        "type": sig.name,
+                        "offset": pos,
+                        "size": len(payload),
+                        "sha256": rec.sha256,
+                        "method": "signature",
+                    },
+                )
 
                 if len(recovered) >= MAX_RECOVERED_FILES:
                     if progress_cb:
@@ -445,6 +586,17 @@ def carve_image(
                 # Jump to the end of this file so we don't re-hit its header.
                 pos = end
 
+        if use_ai and len(recovered) < MAX_RECOVERED_FILES:
+            _ai_scan_unclaimed(data, claimed_ranges, out_dir, recovered, progress_cb)
+
+        _chain_log(
+            "RECOVERY_COMPLETED",
+            {
+                "image": str(image_path),
+                "files": len(recovered),
+                "by_type": count_by_type(recovered),
+            },
+        )
         if progress_cb:
             progress_cb("Carving complete.", 1.0)
         return recovered

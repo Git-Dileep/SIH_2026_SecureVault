@@ -9,6 +9,7 @@ import type { RecoveredFile, RecoveryResultsResponse } from '../types';
 import { getRecoveryResults } from '../api/recovery';
 import { fileUrl, reportUrl } from '../api/client';
 import PageHeader from '../components/PageHeader';
+import ConfidenceBar from '../components/ConfidenceBar';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -44,12 +45,13 @@ function FileRow({ file }: { file: RecoveredFile }) {
             <span className="font-medium truncate max-w-[250px]">{file.filename}</span>
           </div>
         </td>
-        <td className="w-1/6 mono">{file.file_type}</td>
+        <td className="w-1/6 mono">
+          <div>{file.file_type}</div>
+          {file.classifier === 'ai' && <span className="ai-badge">AI</span>}
+        </td>
         <td className="w-1/6 mono">{formatBytes(file.size_bytes)}</td>
         <td className="w-1/6">
-          <div className="flex flex-col">
-            <span className="mono text-[12px]">{score} / 100</span>
-          </div>
+          <ConfidenceBar value={file.confidence_score} label={file.classifier === 'ai' ? 'AI' : 'Sig'} />
         </td>
         <td className="w-1/6">
           <span className="mono font-semibold" style={{ color: statusColor }}>{label}</span>
@@ -97,8 +99,14 @@ function FileRow({ file }: { file: RecoveredFile }) {
                     </div>
                     <div className="grid grid-cols-[100px_1fr]">
                       <span className="text-muted">Method:</span>
-                      <span className="mono">{file.recovery_method}</span>
+                      <span className="mono">{file.classifier === 'ai' ? 'ai_classified' : file.recovery_method}</span>
                     </div>
+                    {file.entropy != null && (
+                      <div className="grid grid-cols-[100px_1fr]">
+                        <span className="text-muted">Entropy:</span>
+                        <span className="mono">{file.entropy.toFixed(2)} bits/byte</span>
+                      </div>
+                    )}
                     <div className="grid grid-cols-[100px_1fr]">
                       <span className="text-muted">Offset:</span>
                       <span className="mono">0x{file.offset.toString(16).toUpperCase()}</span>
@@ -201,16 +209,21 @@ export default function RecoveryResults() {
         title="Recovery Operations"
         subtitle={`Session: ${data.session_id} • Target: ${data.evidence_id}${data.message ? ` • ${data.message}` : ''}`}
         actions={
-          data.evidence_id ? (
-            <a
-              className="btn btn-secondary mono text-[12px] no-underline"
-              href={reportUrl(data.evidence_id, 'html')}
-              target="_blank"
-              rel="noreferrer"
-            >
-              HTML REPORT
-            </a>
-          ) : null
+          <div className="flex gap-2">
+            <Link to="/audit/chain" className="btn btn-secondary mono text-[12px] no-underline">
+              VIEW AUDIT TRAIL
+            </Link>
+            {data.evidence_id ? (
+              <a
+                className="btn btn-secondary mono text-[12px] no-underline"
+                href={reportUrl(data.evidence_id, 'html')}
+                target="_blank"
+                rel="noreferrer"
+              >
+                HTML REPORT
+              </a>
+            ) : null}
+          </div>
         }
       />
 
@@ -268,7 +281,7 @@ export default function RecoveryResults() {
               <th>Filename</th>
               <th>File Type</th>
               <th>Size</th>
-              <th>Confidence</th>
+              <th>AI Confidence</th>
               <th>Status</th>
               <th></th>
             </tr>
