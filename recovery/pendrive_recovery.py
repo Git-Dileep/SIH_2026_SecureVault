@@ -35,19 +35,12 @@ class PendrivePNGRecoverer:
 
             for dev in detect_all_devices():
                 if dev.drive_letter.upper() == drive_clean:
+                    if not dev.is_removable:
+                        raise ValueError(f"Security Exception: Drive {drive_clean} is a FIXED/LOCAL drive. This tool strictly allows access to removable pendrives only.")
                     return dev
-            # Create generic descriptor if not found in enumeration
-            return StorageDevice(
-                device_id=drive_clean,
-                drive_letter=drive_clean,
-                mount_point=f"{drive_clean}\\",
-                raw_path=rf"\\.\{drive_clean}",
-                is_removable=True,
-                volume_label="UserSpecified",
-                file_system="Unknown",
-                total_bytes=0,
-                free_bytes=0,
-            )
+            
+            # Refuse access if the drive cannot be verified as removable
+            raise ValueError(f"Device {drive_clean} not found or could not be verified as a removable pendrive.")
 
         removables = detect_removable_devices()
         if removables and not watch:
@@ -70,6 +63,9 @@ class PendrivePNGRecoverer:
         Executes PNG recovery on the given storage device.
         Attempts raw volume reading, with a fallback to cluster file scanning if permissions restrict raw access.
         """
+        if not device.is_removable:
+            raise PermissionError(f"Security Policy Violation: Drive {device.drive_letter} is a FIXED/LOCAL disk. Recovery is strictly limited to removable USB pendrives.")
+        
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         safe_name = device.drive_letter.replace(":", "")
         out_dir = self.output_base_dir / f"recovery_{safe_name}_{timestamp}"
@@ -85,11 +81,14 @@ class PendrivePNGRecoverer:
         can_read_raw = False
         try:
             with open(raw_target, "rb") as test_f:
+                # Read 512 bytes (boot sector), then a full chunk to ensure we truly have bulk read permissions.
+                # Windows often allows reading the boot sector without Admin, but denies bulk reads.
                 test_f.read(512)
+                test_f.read(chunk_size)
                 can_read_raw = True
         except PermissionError:
             print("[!] Raw sector access requires Administrator privileges.")
-            print("[*] Falling back to direct volume file structure & unallocated stream search...")
+            print("[*] Falling back to direct volume file structure scan...")
         except Exception as e:
             print(f"[!] Could not open raw device {raw_target}: {e}")
 

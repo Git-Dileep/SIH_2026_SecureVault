@@ -6,6 +6,7 @@ Attempts to auto-detect inserted USB pendrive and recover/carve PNG images from 
 
 import argparse
 import sys
+import os
 from pathlib import Path
 
 # Add project root to sys.path
@@ -82,6 +83,11 @@ def main():
 
     # Disk Image file mode
     if args.image:
+        if str(args.image).startswith("\\\\.\\"):
+            print("[!] Security Error: --image cannot be used to scan raw physical Windows drives.")
+            print("[!] Please use --drive to safely scan removable pendrives.")
+            sys.exit(1)
+
         img_path = Path(args.image)
         if not img_path.exists():
             print(f"[!] Error: Disk image file '{args.image}' not found.")
@@ -100,10 +106,18 @@ def main():
             specific_drive=args.drive,
             watch=args.watch,
         )
-        recoverer.recover(device)
+        summary = recoverer.recover(device)
+        
+        # Auto-open the recovered directory to show the user
+        if sys.platform == "win32" and "output_directory" in summary:
+            print("[*] Opening recovered files folder...")
+            os.startfile(summary["output_directory"])
+
     except KeyboardInterrupt:
         print("\n[*] Operation cancelled by user.")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"\n[!] Error during recovery: {e}")
         sys.exit(1)
 

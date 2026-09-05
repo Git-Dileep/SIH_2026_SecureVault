@@ -90,71 +90,51 @@ class PNGCarver(BaseCarver):
 
         return has_ihdr and has_iend
 
-    def _extract_png_at_offset(
-        self, stream: BinaryIO, start_offset: int
-    ) -> Optional[Tuple[bytes, Dict[str, Any], bool]]:
-        """
-        Attempts to parse a complete PNG starting at start_offset in stream.
-        Returns (data, metadata, is_valid) or None.
-        """
-        current_pos = stream.tell()
-        try:
-            stream.seek(start_offset)
-            header = stream.read(8)
-            if header != PNG_SIGNATURE:
-                return None
-
-            png_bytes = bytearray(header)
-            metadata: Dict[str, Any] = {}
-            all_crc_valid = True
-            has_ihdr = False
-
-            while len(png_bytes) < self._max_file_size:
-                chunk_header = stream.read(8)
-                if len(chunk_header) < 8:
-                    break
-
-                length, chunk_type = struct.unpack(">I4s", chunk_header)
-
-                # Check if chunk length is reasonable and chunk type is valid ASCII
-                if length > self._max_file_size or not all(
-                    65 <= b <= 90 or 97 <= b <= 122 for b in chunk_type
-                ):
-                    return None
-
-                chunk_data = stream.read(length)
-                if len(chunk_data) < length:
-                    return None
-
-                crc_bytes = stream.read(4)
-                if len(crc_bytes) < 4:
-                    return None
-
-                (chunk_crc,) = struct.unpack(">I", crc_bytes)
-
-                if self._verify_crc:
-                    calc_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
-                    if calc_crc != chunk_crc:
-                        all_crc_valid = False
-
-                png_bytes.extend(chunk_header)
-                png_bytes.extend(chunk_data)
-                png_bytes.extend(crc_bytes)
-
-                if chunk_type == IHDR_CHUNK_TYPE:
-                    has_ihdr = True
-                    metadata.update(self.parse_ihdr(chunk_data))
-
-                if chunk_type == IEND_CHUNK_TYPE:
-                    if has_ihdr:
-                        final_data = bytes(png_bytes)
-                        is_valid = all_crc_valid if self._verify_crc else True
-                        return final_data, metadata, is_valid
-                    return None
-
-            return None
-        finally:
-            stream.seek(current_pos)
+    def _try_parse_png_memory(self, buffer: bytearray, start_idx: int) -> Any:
+        """Returns (png_data, meta, is_valid) or 'INVALID' or 'NEED_MORE'"""
+        if len(buffer) - start_idx < 8:
+            return "NEED_MORE"
+            
+        offset = start_idx + 8
+        total_len = len(buffer)
+        
+        has_ihdr = False
+        all_crc_valid = True
+        metadata = {}
+        
+        while True:
+            if offset + 8 > total_len:
+                return "NEED_MORE"
+                
+            length, chunk_type = struct.unpack(">I4s", buffer[offset:offset+8])
+            
+            # Check if chunk length is reasonable and chunk type is valid ASCII
+            if length > self._max_file_size or not all(65 <= b <= 90 or 97 <= b <= 122 for b in chunk_type):
+                return "INVALID"
+                
+            if offset + 8 + length + 4 > total_len:
+                return "NEED_MORE"
+                
+            chunk_data = buffer[offset+8 : offset+8+length]
+            (chunk_crc,) = struct.unpack(">I", buffer[offset+8+length : offset+8+length+4])
+            
+            if self._verify_crc:
+                calc_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+                if calc_crc != chunk_crc:
+                    all_crc_valid = False
+                    
+            if chunk_type == IHDR_CHUNK_TYPE:
+                has_ihdr = True
+                metadata.update(self.parse_ihdr(chunk_data))
+                
+            offset += 8 + length + 4
+            
+            if chunk_type == IEND_CHUNK_TYPE:
+                if has_ihdr:
+                    png_data = bytes(buffer[start_idx:offset])
+                    is_valid = all_crc_valid if self._verify_crc else True
+                    return (png_data, metadata, is_valid)
+                return "INVALID"
 
     def carve_stream(
         self,
@@ -164,41 +144,65 @@ class PNGCarver(BaseCarver):
     ) -> Generator[CarvedFile, None, None]:
         """
         Scans a binary stream using a sliding window for PNG headers,
-        and extracts valid PNG files without loading the entire stream into memory.
+        and extracts valid PNG files entirely in memory without seeking the physical disk.
         """
         self._max_file_size = max_file_size
         sig = self.header_signature
-        sig_len = len(sig)
 
-        stream.seek(0, 2)
-        total_stream_size = stream.tell()
-        stream.seek(0)
+        buffer = bytearray()
+        buffer_start_offset = 0
 
-        current_offset = 0
-        overlap = sig_len - 1
-        buffer = b""
+        while True:
+            try:
+                chunk = stream.read(chunk_size)
+            except OSError as e:
+                # Windows may throw PermissionError (Errno 13) when reading locked filesystem sectors 
+                # (like MFT/FAT) if not running as Administrator. Skip the unreadable chunk!
+                try:
+                    # Advance the stream manually to bypass the locked region
+                    stream.seek(chunk_size, 1)
+                    continue
+                except OSError:
+                    # If we can't seek past it, we have to abort this stream
+                    break
 
-        while current_offset < total_stream_size:
-            chunk = stream.read(chunk_size)
-            if not chunk:
+            if not chunk and len(buffer) == 0:
                 break
+            
+            if chunk:
+                buffer.extend(chunk)
 
-            data = buffer + chunk
             search_start = 0
+            need_more_data = False
 
             while True:
-                found_idx = data.find(sig, search_start)
+                found_idx = buffer.find(sig, search_start)
                 if found_idx == -1:
                     break
 
-                abs_file_offset = current_offset - len(buffer) + found_idx
-                extracted = self._extract_png_at_offset(stream, abs_file_offset)
+                res = self._try_parse_png_memory(buffer, found_idx)
 
-                if extracted is not None:
-                    png_data, meta, is_valid = extracted
+                if res == "NEED_MORE":
+                    if not chunk:  # EOF, can't get more data
+                        search_start = found_idx + 1
+                        continue
+                    if len(buffer) - found_idx > self._max_file_size:
+                        search_start = found_idx + 1
+                        continue
+                    
+                    need_more_data = True
+                    break  # Break out to read the next chunk
+                
+                elif res == "INVALID":
+                    search_start = found_idx + 1
+                
+                else:
+                    png_data, meta, is_valid = res
+                    abs_file_offset = buffer_start_offset + found_idx
                     sha256 = hashlib.sha256(png_data).hexdigest()
                     meta["sha256"] = sha256
-                    carved = CarvedFile(
+                    
+                    yield CarvedFile(
                         file_type=self.file_type,
                         offset=abs_file_offset,
                         size=len(png_data),
@@ -207,15 +211,21 @@ class PNGCarver(BaseCarver):
                         is_valid=is_valid,
                         metadata=meta,
                     )
-                    yield carved
-                    # Advance search past this extracted file if it fit within data
                     search_start = found_idx + len(png_data)
-                else:
-                    search_start = found_idx + 1
 
-            if len(data) >= overlap:
-                buffer = data[-overlap:]
+            if need_more_data:
+                # Keep everything from found_idx onwards to continue parsing
+                buffer_start_offset += found_idx
+                buffer = buffer[found_idx:]
             else:
-                buffer = data
-
-            current_offset = stream.tell()
+                # Discard processed bytes, keep overlap for cross-chunk signatures
+                overlap = len(sig) - 1
+                if len(buffer) > overlap:
+                    buffer_start_offset += len(buffer) - overlap
+                    buffer = buffer[-overlap:]
+                else:
+                    buffer_start_offset += len(buffer)
+                    buffer = bytearray()
+                    
+            if not chunk:
+                break
