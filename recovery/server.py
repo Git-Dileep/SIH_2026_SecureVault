@@ -1423,6 +1423,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path in ("/api/v1/erasure/start", "/api/v1/erasure/sanitize", "/api/erasure/sanitize"):
+            role = self.headers.get("X-User-Role", "admin")
+            if role != "admin":
+                self._send_json({"error": "Forbidden: Only admins can start erasure jobs"}, 403)
+                return
             body = self._parse_json()
             device = body.get("device") or body.get("deviceName") or body.get("device_path")
             method = body.get("method") or ("auto" if "sanitize" in path else "auto")

@@ -11,7 +11,7 @@ interface StatCardProps {
 
 export default function StatCard({ label, value, icon, trend, accent = 'var(--color-accent)' }: StatCardProps) {
   return (
-    <div className="card flex flex-col gap-4 group hover:translate-y-[-2px] transition-transform duration-200">
+    <div className="card flex flex-col gap-4 group hover-lift hover-glow transition-transform duration-200">
       <div className="flex items-center justify-between">
         <span className="text-[13px] font-medium" style={{ color: 'var(--color-text-muted)' }}>
           {label}

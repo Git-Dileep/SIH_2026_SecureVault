@@ -31,7 +31,10 @@ export async function apiGet<T>(path: string, mockData: T): Promise<T> {
     return structuredClone(mockData);
   }
 
-  const res = await fetch(`${API_BASE_URL}${path}`, { headers: authHeaders() });
+  const role = localStorage.getItem('sv_role') || 'admin';
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    headers: { 'X-User-Role': role, ...authHeaders() },
+  });
   maybeAuthRedirect(res, path);
   if (!res.ok) {
     throw new Error(await readError(res, path));
@@ -49,9 +52,14 @@ export async function apiPost<T>(path: string, body: unknown, mockResponse: T): 
     return structuredClone(mockResponse);
   }
 
+  const role = localStorage.getItem('sv_role') || 'admin';
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 
+      'Content-Type': 'application/json',
+      'X-User-Role': role,
+      ...authHeaders()
+    },
     body: JSON.stringify(body),
   });
 
@@ -68,9 +76,10 @@ export async function apiUpload<T>(path: string, form: FormData, mockResponse: T
     return structuredClone(mockResponse);
   }
 
+  const role = localStorage.getItem('sv_role') || 'admin';
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
-    headers: authHeaders(),
+    headers: { 'X-User-Role': role, ...authHeaders() },
     body: form,
   });
 

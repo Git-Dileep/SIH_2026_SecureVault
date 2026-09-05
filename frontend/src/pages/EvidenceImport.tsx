@@ -4,6 +4,7 @@ import type { Evidence } from '../types';
 import { getEvidenceList, importEvidence, startRecovery } from '../api/recovery';
 import PageHeader from '../components/PageHeader';
 import { EvidenceStatusBadge } from '../components/StatusBadge';
+import Tooltip from '../components/Tooltip';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -85,13 +86,15 @@ export default function EvidenceImport() {
         title="Evidence Library"
         subtitle="Import a raw disk image. The Python carver scans it read-only."
         actions={
-          <button
-            className="btn btn-primary mono text-[12px]"
-            disabled={importing}
-            onClick={() => void runImport({ demo: true })}
-          >
-            {importing ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
-          </button>
+          <Tooltip text="Populate a test evidence image">
+            <button
+              className="btn btn-primary mono text-[12px] hover-lift"
+              disabled={importing}
+              onClick={() => void runImport({ demo: true })}
+            >
+              {importing ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
+            </button>
+          </Tooltip>
         }
       />
 
@@ -113,22 +116,24 @@ export default function EvidenceImport() {
         }}
       />
 
-      <div
-        className={`upload-zone mb-6 ${dragOver ? 'border-accent bg-surface-hover' : ''}`}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={handleDrop}
-        onClick={() => fileRef.current?.click()}
-      >
-        {importing ? (
-          <div className="text-[13px] text-muted uppercase tracking-wider">Hashing image and starting carve...</div>
-        ) : (
-          <div>
-            <div className="text-[13px] font-medium mb-1">Click or drag a raw image (.img / .dd / .raw)</div>
-            <div className="text-[12px] text-muted mono">Or use Load demo image for testdata/synthetic_disk.img</div>
-          </div>
-        )}
-      </div>
+      <Tooltip text="Click to select a file or drag and drop">
+        <div
+          className={`upload-zone mb-6 ${dragOver ? 'border-accent bg-surface-hover' : ''}`}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          onClick={() => fileRef.current?.click()}
+        >
+          {importing ? (
+            <div className="text-[13px] text-muted uppercase tracking-wider">Hashing image and starting carve...</div>
+          ) : (
+            <div>
+              <div className="text-[13px] font-medium mb-1">Click or drag a raw image (.img / .dd / .raw)</div>
+              <div className="text-[12px] text-muted mono">Or use Load demo image for testdata/synthetic_disk.img</div>
+            </div>
+          )}
+        </div>
+      </Tooltip>
 
       {/* Evidence table */}
       <div id="library" className="card p-0 overflow-hidden">
@@ -170,14 +175,18 @@ export default function EvidenceImport() {
                   </td>
                   <td className="text-[12px]">
                     <div className="flex gap-3">
-                      <Link to="/recovery/results" className="text-accent hover:underline">Results</Link>
-                      <button
-                        className="btn-ghost p-0 text-[12px]"
-                        onClick={() => void handleRecarve(ev.id)}
-                        disabled={ev.status === 'analyzing' || ev.status === 'importing'}
-                      >
-                        Re-carve
-                      </button>
+                      <Tooltip text="View recovery results">
+                        <Link to="/recovery/results" className="text-accent hover:underline hover-glow">Results</Link>
+                      </Tooltip>
+                      <Tooltip text="Run carving algorithm again">
+                        <button
+                          className="btn-ghost p-0 text-[12px] hover-glow"
+                          onClick={() => void handleRecarve(ev.id)}
+                          disabled={ev.status === 'analyzing' || ev.status === 'importing'}
+                        >
+                          Re-carve
+                        </button>
+                      </Tooltip>
                     </div>
                   </td>
                 </tr>

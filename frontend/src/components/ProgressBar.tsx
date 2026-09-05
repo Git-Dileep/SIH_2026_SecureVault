@@ -2,9 +2,10 @@ interface ProgressBarProps {
   value: number; // 0–100
   size?: 'sm' | 'md';
   colorVar?: string;
+  active?: boolean;
 }
 
-export default function ProgressBar({ value, size = 'sm', colorVar }: ProgressBarProps) {
+export default function ProgressBar({ value, size = 'sm', colorVar, active = false }: ProgressBarProps) {
   const clamped = Math.min(100, Math.max(0, value));
 
   const color =
@@ -21,7 +22,7 @@ export default function ProgressBar({ value, size = 'sm', colorVar }: ProgressBa
       style={{ height: size === 'md' ? '8px' : '6px' }}
     >
       <div
-        className="progress-fill"
+        className={`progress-fill ${active ? 'progress-active' : ''}`}
         style={{
           width: `${clamped}%`,
           background: `linear-gradient(90deg, ${color}, color-mix(in srgb, ${color} 70%, white))`,

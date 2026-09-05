@@ -5,6 +5,7 @@ import type { DashboardStats, Evidence } from '../types';
 import { getDashboardStats, getEvidenceList, importEvidence } from '../api/recovery';
 import PageHeader from '../components/PageHeader';
 import { EvidenceStatusBadge, OutcomeBadge } from '../components/StatusBadge';
+import Tooltip from '../components/Tooltip';
 
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
@@ -65,11 +66,25 @@ export default function Dashboard() {
     );
   }
 
+  const isLive = stats?.sessions?.some((session) => session.status === 'running');
+
   return (
     <>
       <PageHeader
         title="Overview"
-        subtitle="SSD-aware NIST purge · AI fragment classifier · blockchain chain-of-custody"
+        subtitle={
+          <div className="flex items-center gap-2">
+            <span>SSD-aware NIST purge · AI fragment classifier · blockchain chain-of-custody</span>
+            {isLive && (
+              <Tooltip text="Live polling active">
+                <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold tracking-widest" style={{ background: 'var(--color-success-muted)', color: 'var(--color-success)' }}>
+                  <span className="live-dot" />
+                  LIVE
+                </span>
+              </Tooltip>
+            )}
+          </div>
+        }
         actions={
           <div className="flex gap-2">
             <Link to="/demo/delete-recover" className="btn btn-secondary mono text-[12px] no-underline">
@@ -78,9 +93,11 @@ export default function Dashboard() {
             <Link to="/audit/chain" className="btn btn-secondary mono text-[12px] no-underline">
               CUSTODY CHAIN
             </Link>
-            <button className="btn btn-primary mono text-[12px]" disabled={seeding} onClick={() => void loadDemo()}>
-              {seeding ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
-            </button>
+            <Tooltip text="Populate a test evidence image">
+              <button className="btn btn-primary mono text-[12px] hover-lift" disabled={seeding} onClick={() => void loadDemo()}>
+                {seeding ? 'IMPORTING…' : 'LOAD DEMO IMAGE'}
+              </button>
+            </Tooltip>
           </div>
         }
       />
@@ -116,32 +133,40 @@ export default function Dashboard() {
 
       {/* Compact Stat Cards */}
       <div className="grid grid-cols-4 gap-4 mb-6">
-        <div className="card flex flex-col gap-2">
-          <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider">
-            <span>Evidence Items</span>
-            <Database size={14} />
-          </div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Total raw images or logical volumes acquired" position="bottom">
+            <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">
+              <span>Evidence Items</span>
+              <Database size={14} className="ml-2" />
+            </div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{stats.total_evidence}</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider">
-            <span>Recovered Files</span>
-            <FileSearch size={14} />
-          </div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Number of unique files carved via structure analysis" position="bottom">
+            <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">
+              <span>Recovered Files</span>
+              <FileSearch size={14} className="ml-2" />
+            </div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{stats.files_recovered}</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider">
-            <span>Erasures Completed</span>
-            <ShieldCheck size={14} />
-          </div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Total successful sanitization workflows" position="bottom">
+            <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">
+              <span>Erasures Completed</span>
+              <ShieldCheck size={14} className="ml-2" />
+            </div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{stats.erasures_completed}</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider">
-            <span>Audit Events</span>
-            <ScrollText size={14} />
-          </div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Cryptographically chained audit records" position="bottom">
+            <div className="flex items-center justify-between text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">
+              <span>Audit Events</span>
+              <ScrollText size={14} className="ml-2" />
+            </div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{stats.audit_events}</div>
         </div>
       </div>
@@ -200,7 +225,7 @@ export default function Dashboard() {
                     <span style={{ color }}>{session.status === 'completed' ? '100%' : `${pct}%`}</span>
                   </div>
                   <div className="progress-track">
-                    <div className="progress-fill" style={{ width: `${session.status === 'completed' ? 100 : pct}%`, background: color }} />
+                    <div className={`progress-fill ${session.status === 'running' ? 'progress-active' : ''}`} style={{ width: `${session.status === 'completed' ? 100 : pct}%`, background: color }} />
                   </div>
                   {session.message && (
                     <div className="mt-1 text-[11px] text-muted mono">{session.message}</div>

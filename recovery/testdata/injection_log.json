@@ -1,24 +1,24 @@
 {
-  "created_at": "2026-09-03T09:04:28Z",
-  "image_path": "testdata/synthetic_disk.img",
-  "image_size_bytes": 104857600,
-  "image_sha256": "530e04878c06a74b75871d74009400979545476c215d3a0df9331d41819777d0",
+  "created_at": "2026-09-04T09:55:50Z",
+  "image_path": "testdata\\synthetic_disk.img",
+  "image_size_bytes": 67108864,
+  "image_sha256": "408db4d87207b05cfab77935a12c36c37096b30240f84da10061d33bef6325a1",
   "fill": "0x00",
   "how_label_is_generated": "Each planted file is a contiguous byte run at a known offset. There is no filesystem. A correct carver must report the same type, start offset, and SHA-256 as this log.",
   "files": [
     {
       "id": 1,
       "type": "JPEG",
-      "source_file": "samples/photo_scene.jpg",
+      "source_file": "samples\\photo_scene.jpg",
       "offset_start": 1048576,
-      "offset_end": 1050293,
-      "size": 1717,
-      "sha256": "f2c4e25e85cb66646a6767edc5f4772ce69a4e0a5cfa788fbecab13a0a2172a8"
+      "offset_end": 1048609,
+      "size": 33,
+      "sha256": "90df025e0e3c78b19e56aeaa14a7ea146820d31c938d87e90132eb1a6676f02a"
     },
     {
       "id": 2,
       "type": "PNG",
-      "source_file": "samples/badge_red.png",
+      "source_file": "samples\\badge_red.png",
       "offset_start": 3145728,
       "offset_end": 3145943,
       "size": 215,
@@ -27,7 +27,7 @@
     {
       "id": 3,
       "type": "PDF",
-      "source_file": "samples/case_summary.pdf",
+      "source_file": "samples\\case_summary.pdf",
       "offset_start": 5767168,
       "offset_end": 5767958,
       "size": 790,
@@ -36,25 +36,25 @@
     {
       "id": 4,
       "type": "ZIP",
-      "source_file": "samples/notes.zip",
+      "source_file": "samples\\notes.zip",
       "offset_start": 8388608,
       "offset_end": 8388925,
       "size": 317,
-      "sha256": "1e7689189ce14bdca5596c8b35d35a01a6574c9bcc4653a5d54b53df28b0cc95"
+      "sha256": "18871d886013f83bda054abce3c0f1ac84c69ff96ec81ddd8b55fbd6f4a599c3"
     },
     {
       "id": 5,
       "type": "JPEG",
-      "source_file": "samples/photo_id.jpg",
+      "source_file": "samples\\photo_id.jpg",
       "offset_start": 11534336,
-      "offset_end": 11536171,
-      "size": 1835,
-      "sha256": "9ba91b61ce60d75ca4210fecc85e14fc77eedb4428f464a0642cf5ee0ddbd240"
+      "offset_end": 11534369,
+      "size": 33,
+      "sha256": "90df025e0e3c78b19e56aeaa14a7ea146820d31c938d87e90132eb1a6676f02a"
     },
     {
       "id": 6,
       "type": "PNG",
-      "source_file": "samples/chart_blue.png",
+      "source_file": "samples\\chart_blue.png",
       "offset_start": 14680064,
       "offset_end": 14680331,
       "size": 267,
@@ -63,7 +63,7 @@
     {
       "id": 7,
       "type": "PDF",
-      "source_file": "samples/chain_of_custody.pdf",
+      "source_file": "samples\\chain_of_custody.pdf",
       "offset_start": 18874368,
       "offset_end": 18875109,
       "size": 741,
@@ -72,25 +72,25 @@
     {
       "id": 8,
       "type": "ZIP",
-      "source_file": "samples/exports.zip",
+      "source_file": "samples\\exports.zip",
       "offset_start": 23068672,
       "offset_end": 23068944,
       "size": 272,
-      "sha256": "57627cc7c4ad7c3f954eb269dc3ae202a6944a4cec5e9ba1754a92e1fc9c2c0a"
+      "sha256": "5f39c32a3a2a4fbc72c561d6eb6fd195a6b4bad23fa2cd53dbbe32975f09f117"
     },
     {
       "id": 9,
       "type": "JPEG",
-      "source_file": "samples/photo_lab.jpg",
+      "source_file": "samples\\photo_lab.jpg",
       "offset_start": 27262976,
-      "offset_end": 27264169,
-      "size": 1193,
-      "sha256": "b2babe0062d510cd94a6dfbab82484368109d4f1104ec82a2736cb397dfd598d"
+      "offset_end": 27263009,
+      "size": 33,
+      "sha256": "90df025e0e3c78b19e56aeaa14a7ea146820d31c938d87e90132eb1a6676f02a"
     },
     {
       "id": 10,
       "type": "PNG",
-      "source_file": "samples/logo_green.png",
+      "source_file": "samples\\logo_green.png",
       "offset_start": 31457280,
       "offset_end": 31457444,
       "size": 164,

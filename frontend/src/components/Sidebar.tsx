@@ -1,4 +1,4 @@
-import { NavLink, useLocation, useNavigate } from 'react-router';
+import { NavLink, useLocation, useNavigate, Link } from 'react-router';
 import { clearSession, getOperator } from '../auth';
 import { logoutOperator } from '../api/recovery';
 import {
@@ -12,7 +12,10 @@ import {
   ScrollText,
   Settings,
   Brain,
+  ShieldAlert,
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import Tooltip from './Tooltip';
 
 const SECTIONS = [
   {
@@ -31,7 +34,8 @@ const SECTIONS = [
     title: 'OPERATIONS',
     items: [
       { path: '/recovery/results', label: 'Recovery', icon: HardDrive },
-      { path: '/erasure/ssd', label: 'SSD-Aware Erasure', icon: ShieldOff },
+      { path: '/erasure', label: 'Erasure', icon: ShieldOff, requiresAdmin: true },
+      { path: '/erasure/ssd', label: 'SSD-Aware Erasure', icon: ShieldOff, requiresAdmin: true },
       { path: '/ai/classifier', label: 'AI Classifier', icon: Brain },
     ],
   },
@@ -54,7 +58,8 @@ const SECTIONS = [
 export default function Sidebar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const user = getOperator();
+  const operator = getOperator();
+  const { user, isAdmin } = useAuth();
 
   const signOut = async () => {
     try {
@@ -67,7 +72,7 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="fixed left-0 top-0 bottom-0 w-[240px] flex flex-col border-r"
+    <aside className="fixed left-0 top-0 bottom-0 w-[240px] flex flex-col border-r z-40"
       style={{
         background: 'var(--color-bg-surface)',
         borderColor: 'var(--color-border)',
@@ -75,7 +80,7 @@ export default function Sidebar() {
     >
       {/* Header */}
       <div className="flex items-center gap-3 px-6 py-5 border-b" style={{ borderColor: 'var(--color-border)' }}>
-        <div className="w-6 h-6 flex items-center justify-center rounded-sm"
+        <div className="w-6 h-6 flex items-center justify-center rounded-sm hover-glow"
           style={{ background: 'var(--color-accent)' }}
         >
           <span className="text-[12px] font-bold text-white font-mono">SV</span>
@@ -91,7 +96,7 @@ export default function Sidebar() {
       <nav className="flex-1 py-4 flex flex-col overflow-y-auto">
         {SECTIONS.map((section, idx) => (
           <div key={idx} className="mb-6 px-4">
-            <h2 className="text-[11px] font-semibold mb-2 px-2 tracking-widest text-muted uppercase" style={{ color: 'var(--color-text-muted)' }}>
+            <h2 className="text-[11px] font-semibold mb-2 px-2 tracking-widest text-muted uppercase">
               {section.title}
             </h2>
             <div className="flex flex-col gap-0.5">
@@ -102,20 +107,36 @@ export default function Sidebar() {
                   : current === item.path;
                 
                 const Icon = item.icon;
+                const disabled = item.requiresAdmin && !isAdmin;
+
+                const navLink = (
+                  <NavLink
+                    to={disabled ? '#' : item.path}
+                    className={`flex items-center gap-3 px-2 py-1.5 rounded text-[13px] font-medium transition-colors duration-100 no-underline ${disabled ? 'role-disabled' : 'hover:bg-bg-surface-hover'}`}
+                    style={{
+                      background: isActive && !disabled ? 'var(--color-bg-elevated)' : '',
+                      color: isActive && !disabled ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
+                    }}
+                    onClick={(e) => disabled && e.preventDefault()}
+                  >
+                    <Icon size={14} style={{ color: isActive && !disabled ? 'var(--color-accent)' : 'var(--color-text-muted)' }} />
+                    <span className="flex-1">{item.label}</span>
+                    {disabled && <ShieldAlert size={12} className="text-warning" />}
+                  </NavLink>
+                );
 
                 return (
-                  <NavLink
-                    key={item.label}
-                    to={item.path}
-                    className="flex items-center gap-3 px-2 py-1.5 rounded text-[13px] font-medium transition-colors duration-100 no-underline"
-                    style={{
-                      background: isActive ? 'var(--color-bg-elevated)' : 'transparent',
-                      color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
-                    }}
-                  >
-                    <Icon size={14} style={{ color: isActive ? 'var(--color-accent)' : 'var(--color-text-muted)' }} />
-                    <span>{item.label}</span>
-                  </NavLink>
+                  <div key={item.label} className={disabled ? 'role-disabled-wrap' : ''}>
+                    {disabled ? (
+                      <Tooltip text="Only admins can access this" position="right">
+                        {navLink}
+                      </Tooltip>
+                    ) : (
+                      <Tooltip text={`Navigate to ${item.label}`} position="right">
+                        {navLink}
+                      </Tooltip>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -123,13 +144,23 @@ export default function Sidebar() {
         ))}
       </nav>
       
-      {/* Footer */}
-      <div className="px-6 py-4 border-t text-[11px] font-mono text-muted" style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
-        Signed in as<br/>
-        <span style={{ color: 'var(--color-text-primary)' }}>{user}</span>
-        <button type="button" className="btn-ghost p-0 mt-2 text-[11px]" onClick={() => void signOut()}>
-          Sign out
-        </button>
+      {/* Footer - User Profile & Sign Out */}
+      <div className="p-4 border-t" style={{ borderColor: 'var(--color-border)' }}>
+        <div className="flex items-center justify-between gap-2">
+          <Link to="/profile" className="flex items-center gap-3 p-2 rounded hover:bg-bg-surface-hover transition-colors no-underline flex-1 min-w-0">
+            <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-mono font-bold shrink-0"
+                 style={{ background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)' }}>
+              {user?.initials || operator?.substring(0,2).toUpperCase() || 'SV'}
+            </div>
+            <div className="flex flex-col flex-1 min-w-0">
+              <span className="text-[12px] font-medium text-primary truncate">{user?.name || operator || 'Operator'}</span>
+              <span className="text-[10px] text-muted mono uppercase">{user?.role || 'User'}</span>
+            </div>
+          </Link>
+          <button type="button" className="btn-ghost p-2 rounded" onClick={() => void signOut()} title="Sign out">
+            <span className="text-[11px] font-mono">Quit</span>
+          </button>
+        </div>
       </div>
     </aside>
   );

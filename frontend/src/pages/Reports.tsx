@@ -4,6 +4,7 @@ import type { DashboardStats, RecoveryResultsResponse } from '../types';
 import { getDashboardStats, getRecoveryResults } from '../api/recovery';
 import { reportUrl } from '../api/client';
 import PageHeader from '../components/PageHeader';
+import Tooltip from '../components/Tooltip';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -61,37 +62,49 @@ export default function Reports() {
         actions={
           <div className="flex gap-2">
             {recovery.evidence_id && (
-              <a
-                className="btn btn-secondary mono text-[12px] no-underline"
-                href={reportUrl(recovery.evidence_id, 'html')}
-                target="_blank"
-                rel="noreferrer"
-              >
-                HTML REPORT
-              </a>
+              <Tooltip text="Download full HTML report of this recovery session">
+                <a
+                  className="btn btn-secondary mono text-[12px] no-underline hover-lift"
+                  href={reportUrl(recovery.evidence_id, 'html')}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  HTML REPORT
+                </a>
+              </Tooltip>
             )}
-            <Link to="/recovery/results" className="btn btn-secondary mono text-[12px] no-underline">
-              OPEN RECOVERY
-            </Link>
+            <Tooltip text="View recovery details">
+              <Link to="/recovery/results" className="btn btn-secondary mono text-[12px] no-underline hover-lift">
+                OPEN RECOVERY
+              </Link>
+            </Tooltip>
           </div>
         }
       />
 
       <div className="grid grid-cols-4 gap-4 mb-6">
-        <div className="card flex flex-col gap-2">
-          <div className="text-[12px] text-muted uppercase tracking-wider">Recovered files</div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Total number of successfully carved files" position="bottom">
+            <div className="text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">Recovered files</div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{recovery.total_files}</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="text-[12px] text-muted uppercase tracking-wider">Avg confidence</div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Average AI confidence score across all files" position="bottom">
+            <div className="text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">Avg confidence</div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{Math.round(stats.avg_confidence * 100)}%</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="text-[12px] text-muted uppercase tracking-wider">Payload size</div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Total physical size of all extracted payloads" position="bottom">
+            <div className="text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">Payload size</div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{formatBytes(totalBytes)}</div>
         </div>
-        <div className="card flex flex-col gap-2">
-          <div className="text-[12px] text-muted uppercase tracking-wider">Audit events</div>
+        <div className="card flex flex-col gap-2 hover-lift">
+          <Tooltip text="Total system-wide recorded audit events" position="bottom">
+            <div className="text-[12px] text-muted uppercase tracking-wider cursor-help w-fit">Audit events</div>
+          </Tooltip>
           <div className="text-[24px] font-mono">{stats.audit_events}</div>
         </div>
       </div>
