@@ -1,435 +1,349 @@
 """
-Sanitizer Orchestration Engine — Owner: Person 5
-Module: erasure.sanitizer
+Media-aware sanitization engine.
 
-End-to-end sanitization workflow pipeline:
-  1. Target Scope Check (device_detection.py)
-  2. Pre-Wipe Cryptographic Hashing (SHA-256 via 4096-byte chunks)
-  3. Chunked Binary Sanitization Overwriting (methods.py)
-  4. Post-Wipe Independent Verification (verification.py)
-  5. Metadata Scrambling (16-char random rename) & Unlink Deletion
-  6. Forensic Audit Certificate Generation (data-schema.md compliant JSON)
+Default mode is SAFE: we never open block devices. We copy a regular file
+(or a virtual demo image) and apply the method that NIST 800-88 Rev. 2
+would select for that media:
+
+  HDD  -> DoD 5220.22-M 7-pass overwrite
+  SSD  -> ATA Secure Erase analogue (firmware Purge)
+  NVMe -> NVMe Format NVM analogue (SES=1)
+
+Set SECUREVAULT_ALLOW_REAL_ERASE=1 to reveal the firmware command that
+*would* be issued. Real ATA/NVMe commands are still refused against the
+boot disk and against any path that is not an explicit allow-listed device.
 """
 
 from __future__ import annotations
 
-import datetime
-import hashlib
-import json
 import os
-import secrets
-import stat
-import string
-import time
-import uuid
-from dataclasses import asdict, dataclass, field
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable
 
-from erasure.device_detection import (
-    StorageMediaType,
-    TargetScopeInfo,
-    validate_sanitization_target,
-)
-from erasure.methods import (
-    DEFAULT_CHUNK_SIZE,
-    OverwriteEngine,
-    SanitizationAlgorithm,
-    SanitizationResult,
-)
-from erasure.verification import (
-    VerificationEngine,
-    VerificationReport,
-    inspect_erasure,
+try:
+    from .device_detection import DriveInfo, detect_device
+    from .methods import (
+        DOD_5220_22M_7PASS,
+        NIST_CLEAR_1PASS,
+        MethodSpec,
+        overwrite_passes,
+        select_method,
+        simulate_firmware_erase,
+    )
+    from .nist_compliance import generate_certificate
+    from .verification import sha256_file, verify_sanitization
+except ImportError:
+    from device_detection import DriveInfo, detect_device
+    from methods import (
+        DOD_5220_22M_7PASS,
+        NIST_CLEAR_1PASS,
+        MethodSpec,
+        overwrite_passes,
+        select_method,
+        simulate_firmware_erase,
+    )
+    from nist_compliance import generate_certificate
+    from verification import sha256_file, verify_sanitization
+
+
+def _chain_log(action: str, details: dict[str, Any]) -> None:
+    """Best-effort write to the forensic blockchain (never fails sanitization)."""
+    try:
+        import sys
+
+        audit_dir = Path(__file__).resolve().parent.parent / "audit"
+        if str(audit_dir) not in sys.path:
+            sys.path.insert(0, str(audit_dir))
+        from blockchain_logger import log_event
+
+        log_event(action, details)
+    except Exception:
+        return
+
+
+ProgressFn = Callable[[str, float], None]
+
+FORBIDDEN_PREFIXES = ("/dev/", "\\\\.\\", "//./")
+SYSTEM_HINTS = (
+    "/dev/sda",
+    "/dev/nvme0n1",
+    "/dev/disk0",
+    "/dev/mmcblk0",
 )
 
 
 @dataclass
-class SanitizationJobResult:
-    """Complete forensic sanitization record conforming to data-schema.md."""
-    id: str
-    target_path: str
-    original_filename: str
-    size_bytes: int
-    pre_wipe_sha256: str
-    erasure_method: str
-    pass_count: int
+class SanitizeResult:
+    job_id: str
+    device: dict[str, Any]
+    method: str
+    technique: str
+    nist_level: str
+    passes_completed: int
     passes_total: int
-    status: str  # "completed" | "failed" | "rejected"
-    started_at: str  # ISO 8601
-    completed_at: str  # ISO 8601
-    timestamp_iso: str  # ISO 8601
-    verification_status: str  # "passed" | "failed" | "skipped"
-    operator_name: str
-    device: Dict[str, Any]
-    verification: Dict[str, Any]
-    certificate_path: Optional[str] = None
-    error_message: Optional[str] = None
+    status: str
+    started_at: str
+    completed_at: str
+    verification: dict[str, Any]
+    certificate: dict[str, Any]
+    details: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert result to dictionary matching data-schema.md."""
-        return asdict(self)
-
-
-def compute_file_sha256(
-    file_path: str | Path,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-) -> str:
-    """
-    Compute pre-wipe SHA-256 cryptographic hash of a file
-    using chunked binary streaming (4096 bytes per chunk).
-    """
-    path = Path(file_path).resolve()
-    hasher = hashlib.sha256()
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            hasher.update(chunk)
-
-    return hasher.hexdigest()
-
-
-def generate_random_filename(length: int = 16) -> str:
-    """Generate a random alphanumeric string to scramble filename metadata traces."""
-    chars = string.ascii_letters + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
-
-
-class Sanitizer:
-    """
-    Forensic Sanitization Orchestration Engine.
-    Executes safety checks, hashing, multi-pass overwriting, verification,
-    directory entry metadata scrubbing, and Certificate of Destruction generation.
-    """
-
-    def __init__(
-        self,
-        certificates_dir: str | Path = "certificates",
-        approved_roots: Optional[List[Path | str]] = None,
-        chunk_size: int = DEFAULT_CHUNK_SIZE,
-    ) -> None:
-        self.certificates_dir = Path(certificates_dir)
-        self.approved_roots = approved_roots
-        self.chunk_size = chunk_size
-        self.overwrite_engine = OverwriteEngine(chunk_size=chunk_size)
-        self.verification_engine = VerificationEngine(sample_chunk_size=chunk_size)
-
-    def sanitize(
-        self,
-        target_path: str | Path,
-        algorithm: SanitizationAlgorithm | str = SanitizationAlgorithm.NIST_800_88_CLEAR,
-        operator_name: str = "Forensic Sanitization Operator",
-        progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
-    ) -> SanitizationJobResult:
-        """
-        Execute full sanitization pipeline on a target file.
-        """
-        job_id = f"san-{uuid.uuid4().hex[:12]}"
-        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        target_str = str(target_path)
-
-        # Normalize algorithm parameter
-        if isinstance(algorithm, str):
-            try:
-                algo_enum = SanitizationAlgorithm(algorithm)
-            except ValueError:
-                algo_enum = SanitizationAlgorithm.NIST_800_88_CLEAR
-        else:
-            algo_enum = algorithm
-
-        # ---------------------------------------------------------------------
-        # Step 1: Scope & Safety Validation
-        # ---------------------------------------------------------------------
-        scope_info = validate_sanitization_target(
-            target_path, approved_roots=self.approved_roots
-        )
-
-        device_dict = {
-            "name": target_str,
-            "type": scope_info.media_type.value if scope_info else "Unknown",
-            "serial": "N/A",
-            "capacity_bytes": scope_info.size_bytes if scope_info else 0,
+    def to_job_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.job_id,
+            "device": self.device,
+            "method": self.nist_level,
+            "passes_completed": self.passes_completed,
+            "passes_total": self.passes_total,
+            "status": self.status,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "verification": {
+                "passed": self.verification.get("passed"),
+                "sample_sectors_checked": self.verification.get("sample_sectors_checked"),
+                "residual_data_found": self.verification.get("residual_data_found"),
+            },
+            "certificate_url": self.details.get("certificate_url"),
+            "details": self.details,
+            "technique": self.technique,
+            "nist_level": self.nist_level,
+            "drive_type": self.device.get("type"),
+            "certificate": self.certificate,
         }
 
-        if not scope_info.is_safe:
-            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            try:
-                filename = Path(target_str).name if not target_str.startswith(r"\\") else target_str
-            except Exception:
-                filename = target_str
-            return self._build_job_record(
-                job_id=job_id,
-                target_path=target_str,
-                filename=filename,
-                size_bytes=scope_info.size_bytes,
-                pre_sha256="N/A (Scope Rejected)",
-                algorithm=algo_enum.value,
-                passes_completed=0,
-                passes_total=self.overwrite_engine._get_pass_count(algo_enum),
-                status="rejected",
-                start_iso=start_iso,
-                end_iso=end_iso,
-                verification_status="skipped",
-                operator_name=operator_name,
-                device=device_dict,
-                verification={"passed": False, "details": scope_info.rejection_reason or "Safety boundary check failed."},
-                error_message=f"Safety Rejection: {scope_info.rejection_reason}",
-            )
 
-        resolved_path = Path(target_str).resolve()
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-        # Clear read-only flags if present to allow write/rename
-        if scope_info.is_read_only:
-            try:
-                os.chmod(resolved_path, stat.S_IWRITE | stat.S_IREAD)
-            except Exception:
-                pass
+def _is_blockish(path: Path) -> bool:
+    raw = str(path)
+    if raw.startswith(FORBIDDEN_PREFIXES):
+        return True
+    try:
+        return path.is_block_device() or path.is_char_device()
+    except (OSError, NotImplementedError):
+        return False
 
-        # ---------------------------------------------------------------------
-        # Step 2: Pre-Wipe Forensic Hashing
-        # ---------------------------------------------------------------------
-        try:
-            pre_wipe_sha256 = compute_file_sha256(resolved_path, chunk_size=self.chunk_size)
-            file_size = resolved_path.stat().st_size
-            device_dict["capacity_bytes"] = file_size
-        except Exception as hash_err:
-            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            return self._build_job_record(
-                job_id=job_id,
-                target_path=str(resolved_path),
-                filename=resolved_path.name,
-                size_bytes=0,
-                pre_sha256="ERROR",
-                algorithm=algo_enum.value,
-                passes_completed=0,
-                passes_total=self.overwrite_engine._get_pass_count(algo_enum),
-                status="failed",
-                start_iso=start_iso,
-                end_iso=end_iso,
-                verification_status="skipped",
-                operator_name=operator_name,
-                device=device_dict,
-                verification={"passed": False, "details": "Failed to compute pre-wipe SHA-256 hash."},
-                error_message=f"Pre-wipe hashing error: {hash_err}",
-            )
 
-        # ---------------------------------------------------------------------
-        # Step 3: Binary Pattern Overwrite
-        # ---------------------------------------------------------------------
-        overwrite_res: SanitizationResult = self.overwrite_engine.sanitize_file(
-            resolved_path,
-            algorithm=algo_enum,
-            progress_callback=progress_callback,
-        )
+def _real_erase_permitted(path: Path) -> bool:
+    if os.environ.get("SECUREVAULT_ALLOW_REAL_ERASE") != "1":
+        return False
+    raw = str(path)
+    if any(raw == hint or raw.startswith(hint + "p") or raw.startswith(hint + "s") for hint in SYSTEM_HINTS):
+        return False
+    return True
 
-        if not overwrite_res.success:
-            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            return self._build_job_record(
-                job_id=job_id,
-                target_path=str(resolved_path),
-                filename=resolved_path.name,
-                size_bytes=file_size,
-                pre_sha256=pre_wipe_sha256,
-                algorithm=algo_enum.value,
-                passes_completed=overwrite_res.passes_completed,
-                passes_total=overwrite_res.passes_total,
-                status="failed",
-                start_iso=start_iso,
-                end_iso=end_iso,
-                verification_status="skipped",
-                operator_name=operator_name,
-                device=device_dict,
-                verification={"passed": False, "details": overwrite_res.error_message or "Overwrite failed."},
-                error_message=overwrite_res.error_message,
-            )
 
-        # ---------------------------------------------------------------------
-        # Step 4: Post-Sanitization Independent Verification
-        # ---------------------------------------------------------------------
-        # Determine expected pattern based on algorithm
-        expected_pat: Optional[bytes] = None
-        if algo_enum == SanitizationAlgorithm.ZERO_OVERWRITE:
-            expected_pat = b"\x00"
+def _copy_target(src: Path, dest: Path) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return dest
 
-        verify_report: VerificationReport = self.verification_engine.inspect(
-            resolved_path, expected_pattern=expected_pat
-        )
 
-        verification_dict = {
-            "passed": verify_report.passed,
-            "sample_sectors_checked": verify_report.sample_sectors_checked,
-            "residual_data_found": verify_report.residual_data_found,
-            "average_entropy": verify_report.average_entropy,
-            "expected_pattern_type": verify_report.expected_pattern_type,
-            "details": verify_report.details,
-        }
+def sanitize(
+    device: str | Path,
+    *,
+    job_id: str,
+    work_dir: str | Path,
+    cert_dir: str | Path,
+    method: str = "auto",
+    operator_id: str = "local-operator",
+    progress: ProgressFn | None = None,
+) -> SanitizeResult:
+    """
+    Run media-aware sanitization on a COPY of `device` (regular file).
 
-        if not verify_report.passed:
-            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            return self._build_job_record(
-                job_id=job_id,
-                target_path=str(resolved_path),
-                filename=resolved_path.name,
-                size_bytes=file_size,
-                pre_sha256=pre_wipe_sha256,
-                algorithm=algo_enum.value,
-                passes_completed=overwrite_res.passes_completed,
-                passes_total=overwrite_res.passes_total,
-                status="failed",
-                start_iso=start_iso,
-                end_iso=end_iso,
-                verification_status="failed",
-                operator_name=operator_name,
-                device=device_dict,
-                verification=verification_dict,
-                error_message="Verification check failed: Residual data or low entropy detected on media.",
-            )
+    Block devices are refused unless SECUREVAULT_ALLOW_REAL_ERASE=1, and
+    even then this prototype still does not issue hdparm/nvme-cli — it
+    records the command that a production appliance would run.
+    """
+    started = _utc_now()
+    src = Path(device).expanduser()
+    if not src.is_absolute():
+        src = src.resolve()
+    else:
+        src = src.resolve()
 
-        # ---------------------------------------------------------------------
-        # Step 5: Metadata Scrambling & Deletion
-        # ---------------------------------------------------------------------
-        try:
-            parent_dir = resolved_path.parent
-            # Generate 16-character random name to scramble directory entries
-            scrambled_name = generate_random_filename(16)
-            scrambled_path = parent_dir / scrambled_name
+    info: DriveInfo = detect_device(src)
+    spec: MethodSpec = select_method(info.drive_type, method)
+    _chain_log(
+        "ERASURE_STARTED",
+        {
+            "job_id": job_id,
+            "device": str(src),
+            "drive_type": info.drive_type,
+            "method": spec.id,
+            "nist_level": spec.nist_level,
+            "operator_id": operator_id,
+        },
+    )
 
-            # Rename to random alphanumeric string
-            resolved_path.rename(scrambled_path)
+    device_public = {
+        "name": str(device),
+        "type": info.drive_type if info.drive_type in ("HDD", "SSD", "NVMe", "USB") else "USB",
+        "serial": info.serial,
+        "capacity_bytes": info.capacity_bytes or (_file_size(src) if src.is_file() else 0),
+    }
 
-            # Truncate to 0 bytes and unlink file
-            try:
-                with open(scrambled_path, "wb") as f:
-                    pass
-            except Exception:
-                pass
-
-            os.remove(scrambled_path)
-
-        except Exception as del_err:
-            end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            return self._build_job_record(
-                job_id=job_id,
-                target_path=str(resolved_path),
-                filename=resolved_path.name,
-                size_bytes=file_size,
-                pre_sha256=pre_wipe_sha256,
-                algorithm=algo_enum.value,
-                passes_completed=overwrite_res.passes_completed,
-                passes_total=overwrite_res.passes_total,
-                status="failed",
-                start_iso=start_iso,
-                end_iso=end_iso,
-                verification_status="passed",
-                operator_name=operator_name,
-                device=device_dict,
-                verification=verification_dict,
-                error_message=f"Sanitization verified but metadata scrubbing/deletion failed: {del_err}",
-            )
-
-        # ---------------------------------------------------------------------
-        # Step 6: Audit Certificate Output (JSON inside certificates/)
-        # ---------------------------------------------------------------------
-        end_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        job_record = self._build_job_record(
+    if spec.id == "destroy":
+        result = SanitizeResult(
             job_id=job_id,
-            target_path=str(resolved_path),
-            filename=resolved_path.name,
-            size_bytes=file_size,
-            pre_sha256=pre_wipe_sha256,
-            algorithm=algo_enum.value,
-            passes_completed=overwrite_res.passes_completed,
-            passes_total=overwrite_res.passes_total,
-            status="completed",
-            start_iso=start_iso,
-            end_iso=end_iso,
-            verification_status="passed",
-            operator_name=operator_name,
-            device=device_dict,
-            verification=verification_dict,
+            device=device_public,
+            method=spec.nist_level,
+            technique=spec.id,
+            nist_level=spec.nist_level,
+            passes_completed=0,
+            passes_total=0,
+            status="failed",
+            started_at=started,
+            completed_at=_utc_now(),
+            verification={
+                "passed": False,
+                "sample_sectors_checked": 0,
+                "residual_data_found": False,
+            },
+            certificate={},
+            details={
+                "error": "Physical destruction is out of scope for this software.",
+                "operator_id": operator_id,
+                "drive_type": info.drive_type,
+                "technique": spec.id,
+                "nist_level": spec.nist_level,
+                "method_label": spec.label,
+            },
+        )
+        return result
+
+    if _is_blockish(src) and not _real_erase_permitted(src):
+        raise PermissionError(
+            "Refusing to operate on a block device. Use a virtual demo target "
+            "(demo_hdd.bin / demo_ssd.bin / demo_nvme.bin) or a regular file. "
+            "Firmware commands are simulated, never issued against /dev/*."
         )
 
-        cert_path = self._write_certificate(job_record)
-        job_record.certificate_path = str(cert_path)
+    if not src.is_file():
+        raise FileNotFoundError(f"Not a regular file: {src}")
 
-        return job_record
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    working = work_dir / f"sanitized_{src.name}"
+    if progress:
+        progress("Creating working COPY (original is never modified)", 0.02)
+    _copy_target(src, working)
 
-    def _build_job_record(
-        self,
-        job_id: str,
-        target_path: str,
-        filename: str,
-        size_bytes: int,
-        pre_sha256: str,
-        algorithm: str,
-        passes_completed: int,
-        passes_total: int,
-        status: str,
-        start_iso: str,
-        end_iso: str,
-        verification_status: str,
-        operator_name: str,
-        device: Dict[str, Any],
-        verification: Dict[str, Any],
-        error_message: Optional[str] = None,
-    ) -> SanitizationJobResult:
-        """Construct a validated SanitizationJobResult object."""
-        return SanitizationJobResult(
-            id=job_id,
-            target_path=target_path,
-            original_filename=filename,
-            size_bytes=size_bytes,
-            pre_wipe_sha256=pre_sha256,
-            erasure_method=algorithm,
-            pass_count=passes_completed,
-            passes_total=passes_total,
-            status=status,
-            started_at=start_iso,
-            completed_at=end_iso,
-            timestamp_iso=end_iso,
-            verification_status=verification_status,
-            operator_name=operator_name,
-            device=device,
-            verification=verification,
-            error_message=error_message,
-        )
+    hash_before = sha256_file(working)
+    size = working.stat().st_size
+    simulated = True
+    firmware = spec.firmware_command.format(device=info.path) if spec.firmware_command else ""
 
-    def _write_certificate(self, record: SanitizationJobResult) -> Path:
-        """Save JSON audit certificate in certificates/ directory."""
-        self.certificates_dir.mkdir(parents=True, exist_ok=True)
-        cert_file = self.certificates_dir / f"certificate_{record.id}.json"
-        
-        with open(cert_file, "w", encoding="utf-8") as f:
-            json.dump(record.to_dict(), f, indent=2)
+    with open(working, "r+b") as handle:
+        if spec.id in ("ata_secure_erase", "nvme_format_nvm"):
+            if progress:
+                progress(f"Simulating {spec.label}", 0.1)
+            simulate_firmware_erase(handle, size, progress=progress)
+            passes = spec.passes
+        elif spec.id == "dod_5220_22m_7pass":
+            passes = overwrite_passes(handle, size, DOD_5220_22M_7PASS, progress=progress)
+        else:
+            passes = overwrite_passes(handle, size, NIST_CLEAR_1PASS, progress=progress)
 
-        return cert_file
-
-
-# Module-level convenience runner
-def sanitize_file(
-    target_path: str | Path,
-    algorithm: SanitizationAlgorithm | str = SanitizationAlgorithm.NIST_800_88_CLEAR,
-    operator_name: str = "Forensic Sanitization Operator",
-    certificates_dir: str | Path = "certificates",
-    approved_roots: Optional[List[Path | str]] = None,
-    progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
-) -> SanitizationJobResult:
-    """
-    Execute full end-to-end sanitization workflow:
-    Scope Validation -> Pre-Wipe SHA-256 -> Overwrite -> Verification ->
-    16-Char Random Rename Deletion -> Audit Certificate Generation.
-    """
-    sanitizer = Sanitizer(
-        certificates_dir=certificates_dir,
-        approved_roots=approved_roots,
+    if progress:
+        progress("Read-back verification", 0.92)
+    verification = verify_sanitization(
+        working,
+        hash_before=hash_before,
+        expected=spec.verification_expectation,
     )
-    return sanitizer.sanitize(
-        target_path=target_path,
-        algorithm=algorithm,
-        operator_name=operator_name,
-        progress_callback=progress_callback,
+    hash_after = verification.hash_after
+
+    details = {
+        "operator_id": operator_id,
+        "device_path": str(src),
+        "working_copy": str(working),
+        "drive_type": info.drive_type,
+        "model": info.model,
+        "protocol": info.protocol,
+        "technique": spec.id,
+        "method_label": spec.label,
+        "nist_level": spec.nist_level,
+        "firmware_command": firmware,
+        "covers_overprovisioning": spec.covers_overprovisioning,
+        "overprovisioning_risk": info.overprovisioning_risk,
+        "simulated": simulated,
+        "hash_before": hash_before,
+        "hash_after": hash_after,
+        "residual_entropy": verification.residual_entropy,
+        "bytes_overwritten": size,
+        "message": spec.description,
+        "detection_notes": info.notes,
+    }
+
+    job_stub = {
+        "id": job_id,
+        "device": device_public,
+        "method": spec.nist_level,
+        "passes_total": passes,
+        "started_at": started,
+        "completed_at": _utc_now(),
+        "verification": verification.to_dict(),
+        "details": details,
+        "operator_id": operator_id,
+    }
+    certificate = generate_certificate(job_stub, cert_dir)
+    details["certificate_url"] = f"/erasure/compliance/{job_id}/file"
+    details["certificate_path"] = certificate.get("pdf_path")
+    details["certificate_json"] = certificate.get("json_path")
+    details["certificate_sha256"] = certificate.get("certificate_sha256")
+
+    status = "completed" if verification.passed else "failed"
+    _chain_log(
+        "ERASURE_COMPLETED",
+        {
+            "job_id": job_id,
+            "drive_type": info.drive_type,
+            "technique": spec.id,
+            "nist_level": spec.nist_level,
+            "status": status,
+            "hash_before": hash_before,
+            "hash_after": hash_after,
+        },
     )
+    _chain_log(
+        "ERASURE_VERIFIED",
+        {
+            "job_id": job_id,
+            "passed": bool(verification.passed),
+            "sample_sectors_checked": verification.sample_sectors_checked,
+            "residual_data_found": bool(verification.residual_data_found),
+        },
+    )
+    return SanitizeResult(
+        job_id=job_id,
+        device=device_public,
+        method=spec.nist_level,
+        technique=spec.id,
+        nist_level=spec.nist_level,
+        passes_completed=passes,
+        passes_total=passes,
+        status=status,
+        started_at=started,
+        completed_at=job_stub["completed_at"],
+        verification=verification.to_dict(),
+        certificate=certificate,
+        details=details,
+    )
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def capabilities_payload(info: DriveInfo) -> dict[str, Any]:
+    return info.to_dict()

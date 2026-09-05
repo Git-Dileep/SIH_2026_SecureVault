@@ -1,0 +1,75 @@
+{
+  "model": "FragmentMLP-3layer (histogram + entropy + magic flags)",
+  "cnn_spec": "Conv1d\u00d72 + Linear\u00d72 (exported when torch is available)",
+  "dataset": "synthetic FFT-75-style 512-byte fragments + recovery/samples",
+  "types": [
+    "jpg",
+    "png",
+    "pdf",
+    "zip",
+    "docx",
+    "xlsx",
+    "mp4",
+    "mp3",
+    "txt",
+    "exe"
+  ],
+  "fragment_size": 512,
+  "samples_per_class": 90,
+  "epochs": 20,
+  "train": {
+    "accuracy": 0.8915,
+    "per_class": {
+      "jpg": 0.6667,
+      "png": 0.8933,
+      "pdf": 0.4868,
+      "zip": 1.0,
+      "docx": 1.0,
+      "xlsx": 1.0,
+      "mp4": 1.0,
+      "mp3": 1.0,
+      "txt": 0.8684,
+      "exe": 1.0
+    },
+    "n": 765
+  },
+  "test": {
+    "accuracy": 0.8815,
+    "per_class": {
+      "jpg": 0.6667,
+      "png": 0.8667,
+      "pdf": 0.5,
+      "zip": 1.0,
+      "docx": 1.0,
+      "xlsx": 1.0,
+      "mp4": 1.0,
+      "mp3": 1.0,
+      "txt": 0.7857,
+      "exe": 1.0
+    },
+    "n": 135
+  },
+  "accuracy": 0.8815,
+  "per_class": {
+    "jpg": 0.6667,
+    "png": 0.8667,
+    "pdf": 0.5,
+    "zip": 1.0,
+    "docx": 1.0,
+    "xlsx": 1.0,
+    "mp4": 1.0,
+    "mp3": 1.0,
+    "txt": 0.7857,
+    "exe": 1.0
+  },
+  "threshold": 0.7,
+  "augmentation": [
+    "header",
+    "mid-file",
+    "tail",
+    "bit-noise",
+    "truncation"
+  ],
+  "baseline_signature_only": 0.62,
+  "notes": "Signature matching on 512-byte fragments typically tops out near 60\u201365%. Mixing a histogram MLP with a magic-byte prior is the MVP path to 90%+ on header-bearing and mid-file fragments of the 10 supported types."
+}

@@ -1,4 +1,14 @@
+import { authHeaders, clearSession } from '../auth';
 import { API_BASE_URL, USE_MOCKS } from '../config';
+
+function maybeAuthRedirect(res: Response, path: string): void {
+  if (res.status !== 401) return;
+  if (path.includes('/auth/login') || path.includes('/auth/register') || path.includes('/auth/me')) return;
+  clearSession();
+  if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+    window.location.assign('/login');
+  }
+}
 
 async function readError(res: Response, path: string): Promise<string> {
   const body = await res.text();
@@ -21,7 +31,8 @@ export async function apiGet<T>(path: string, mockData: T): Promise<T> {
     return structuredClone(mockData);
   }
 
-  const res = await fetch(`${API_BASE_URL}${path}`);
+  const res = await fetch(`${API_BASE_URL}${path}`, { headers: authHeaders() });
+  maybeAuthRedirect(res, path);
   if (!res.ok) {
     throw new Error(await readError(res, path));
   }
@@ -40,10 +51,11 @@ export async function apiPost<T>(path: string, body: unknown, mockResponse: T): 
 
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify(body),
   });
 
+  maybeAuthRedirect(res, path);
   if (!res.ok) {
     throw new Error(await readError(res, path));
   }
@@ -58,9 +70,11 @@ export async function apiUpload<T>(path: string, form: FormData, mockResponse: T
 
   const res = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
+    headers: authHeaders(),
     body: form,
   });
 
+  maybeAuthRedirect(res, path);
   if (!res.ok) {
     throw new Error(await readError(res, path));
   }

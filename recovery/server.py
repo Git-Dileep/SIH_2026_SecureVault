@@ -25,12 +25,43 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from carver import TOOL_NAME, TOOL_VERSION, carve_image, utc_now_iso
+import delete_recover_demo as delete_demo
 from erasure import _is_forbidden, demo_erase
 from generate_test_image import make_pdf
+from lab_runtime import (
+    AUTH_REQUIRED,
+    BIND_HOST,
+    FIRMWARE_SIMULATED,
+    MODE,
+    cors_origin_allowed,
+    issue_session,
+    log_event,
+    new_request_id,
+    parse_bearer,
+    resolve_session,
+    revoke_session,
+)
 from report import write_reports
+import users
+
+# Top-level /erasure and /audit packages share the name `erasure` with this
+# directory's demo module, so they are loaded from the repo root via sys.path.
+_PARENT = Path(__file__).resolve().parent.parent
+for _pkg_dir in (_PARENT / "erasure", _PARENT / "audit", Path(__file__).resolve().parent / "ai"):
+    _s = str(_pkg_dir)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
+
+from device_detection import create_demo_targets, detect_device  # noqa: E402
+from sanitizer import sanitize as media_sanitize  # noqa: E402
+from blockchain import AuditBlockchain  # noqa: E402
+from blockchain_logger import get_logger as get_ledger  # noqa: E402
+from verifier import verify_chain  # noqa: E402
+from fragment_classifier import accuracy_report, classify_fragment, ensure_model  # noqa: E402
+from actor_context import get_actor, set_actor  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent
@@ -41,8 +72,28 @@ RECOVERED_DIR = WORKSPACE / "recovered"
 ERASURE_DIR = WORKSPACE / "erasure"
 CERT_DIR = WORKSPACE / "certificates"
 DEMO_IMAGE = ROOT / "testdata" / "synthetic_disk.img"
+CHAIN_PATH = WORKSPACE / "blockchain.json"
+TARGETS_DIR = WORKSPACE / "targets"
+ERASURE_UPLOADS = WORKSPACE / "erasure_uploads"
+LEDGER_PATH = ROOT.parent / "audit" / "audit_chain.json"
 
-HOST = "127.0.0.1"
+ACTION_TO_LEDGER = {
+    "evidence.import": "EVIDENCE_IMPORTED",
+    "recovery.start": "RECOVERY_STARTED",
+    "recovery.complete": "RECOVERY_COMPLETED",
+    "erasure.start": "ERASURE_STARTED",
+    "erasure.complete": "ERASURE_COMPLETED",
+    "erasure.verify": "ERASURE_VERIFIED",
+    "certificate.generate": "CERTIFICATE_GENERATED",
+    "audit.export": "CHAIN_ANCHORED",
+    "auth.login": "USER_LOGIN",
+    "auth.logout": "USER_LOGOUT",
+    "auth.register": "USER_REGISTERED",
+    "file.export": "FILE_EXPORTED",
+    "ai.classify": "AI_CLASSIFIED",
+}
+
+HOST = BIND_HOST
 DEFAULT_PORT = 8000
 ACTOR = "local-operator"
 UPLOAD_LIMIT = 512 * 1024 * 1024
@@ -51,6 +102,8 @@ CONFIDENCE_SCORE = {"high": 0.92, "medium": 0.64, "low": 0.28}
 
 STATE_LOCK = threading.Lock()
 _state: dict = {}
+_chain: AuditBlockchain | None = None
+_ledger = None
 
 
 def _empty_state() -> dict:
@@ -60,12 +113,172 @@ def _empty_state() -> dict:
         "sessions": [],
         "erasure_jobs": [],
         "audit": [],
+        "actor": ACTOR,
     }
 
 
 def _ensure_dirs() -> None:
-    for path in (WORKSPACE, EVIDENCE_DIR, RECOVERED_DIR, ERASURE_DIR, CERT_DIR):
+    for path in (WORKSPACE, EVIDENCE_DIR, RECOVERED_DIR, ERASURE_DIR, CERT_DIR, TARGETS_DIR, ERASURE_UPLOADS):
         path.mkdir(parents=True, exist_ok=True)
+    create_demo_targets(TARGETS_DIR)
+
+
+def _get_chain() -> AuditBlockchain:
+    global _chain
+    if _chain is None:
+        _chain = AuditBlockchain(CHAIN_PATH)
+    return _chain
+
+
+def _get_ledger():
+    global _ledger
+    if _ledger is None:
+        _ledger = get_ledger(LEDGER_PATH)
+    return _ledger
+
+
+def _ledger_public() -> dict:
+    ledger = _get_ledger()
+    blocks = ledger.get_chain()
+    report = verify_chain(blocks)
+    mapped = []
+    for block in reversed(blocks):
+        details = block.get("details") or {}
+        mapped.append(
+            {
+                "index": block["index"],
+                "timestamp": block["timestamp"],
+                "hash": block["hash"],
+                "prev_hash": block["previous_hash"],
+                "previous_hash": block["previous_hash"],
+                "merkle_root": block["details_hash"],
+                "action": block["action"],
+                "details_hash": block["details_hash"],
+                "details": details,
+                "entries": [
+                    {
+                        "id": f"BLK-{block['index']}",
+                        "timestamp": block["timestamp"],
+                        "actor": details.get("actor") or details.get("username") or details.get("operator_id") or ACTOR,
+                        "action": block["action"],
+                        "target": str(
+                            details.get("job_id")
+                            or details.get("filename")
+                            or details.get("target")
+                            or block["action"]
+                        ),
+                        "outcome": details.get("outcome") or "success",
+                        "details": details,
+                        "prev_hash": block["previous_hash"],
+                        "entry_hash": block["hash"],
+                    }
+                ],
+            }
+        )
+    return {
+        "chain": [_annotate_block(b) for b in blocks],
+        "blocks": mapped,
+        "height": ledger.height(),
+        "tip": ledger.tip()["hash"] if blocks else "",
+        "valid": report["valid"],
+        "status": report["status"],
+        "anchors": [],
+        "verify": report,
+    }
+
+
+_PLAIN = {
+    "GENESIS": "Audit ledger started — empty chain of custody",
+    "USER_LOGIN": "Operator signed in",
+    "USER_LOGOUT": "Operator signed out",
+    "USER_REGISTERED": "New operator account created",
+    "DEMO_STAGE": "Exhibits planted on the suspect disk image",
+    "DEMO_DELETE": "Folder names deleted; directory table wiped; bytes still on disk",
+    "DEMO_UPLOAD": "Operator added a file to the demo",
+    "DEMO_RESET": "Delete-recover demo reset",
+    "EVIDENCE_IMPORTED": "Evidence image imported and hashed",
+    "RECOVERY_STARTED": "File carving started on a raw image",
+    "RECOVERY_COMPLETED": "Carving finished",
+    "FILE_EXTRACTED": "A file was carved from unallocated space",
+    "ERASURE_STARTED": "Sanitization started (working copy)",
+    "ERASURE_COMPLETED": "Sanitization finished",
+    "ERASURE_VERIFIED": "Read-back verification recorded",
+    "CERTIFICATE_GENERATED": "NIST prototype certificate issued",
+    "AI_CLASSIFIED": "A 512-byte fragment was classified",
+    "FILE_EXPORTED": "A recovered file was downloaded",
+    "CHAIN_ANCHORED": "Tip hash recorded as an external anchor",
+}
+
+
+def _current_actor() -> str:
+    actor = get_actor()
+    if actor and actor != "anonymous":
+        return actor
+    return str(_state.get("actor") or ACTOR)
+
+
+def _plain_action(action: str, details: dict | None) -> str:
+    details = details or {}
+    who = str(details.get("actor") or details.get("username") or details.get("operator_id") or "")
+    name = str(details.get("filename") or details.get("original_filename") or "")
+    if action == "USER_LOGIN" and who:
+        return f"{who} signed in"
+    if action == "USER_LOGOUT" and who:
+        return f"{who} signed out"
+    if action == "USER_REGISTERED" and who:
+        return f"New operator account created for {who}"
+    if action == "FILE_EXTRACTED" and name:
+        base = f"Recovered {name} from unallocated space"
+    elif action in ("DEMO_UPLOAD",) and name:
+        base = f"Queued {name} for the suspect image"
+    elif action == "AI_CLASSIFIED":
+        base = f"Classified fragment as {details.get('target') or details.get('file_type') or 'unknown'}"
+    else:
+        base = _PLAIN.get(action, action.replace("_", " ").title())
+    if who and action not in ("GENESIS", "USER_LOGIN", "USER_LOGOUT", "USER_REGISTERED"):
+        return f"{base} — by {who}"
+    return base
+
+
+def _annotate_block(block: dict) -> dict:
+    out = dict(block)
+    details = block.get("details") or {}
+    out["plain"] = _plain_action(str(block.get("action") or ""), details)
+    out["actor"] = details.get("actor") or details.get("username") or details.get("operator_id")
+    return out
+
+
+def _custody_receipt() -> dict:
+    ledger = _get_ledger()
+    blocks = [_annotate_block(b) for b in ledger.get_chain()]
+    report = verify_chain(ledger.get_chain())
+    events = [
+        {
+            "index": b["index"],
+            "timestamp": b["timestamp"],
+            "action": b["action"],
+            "plain": b["plain"],
+            "hash": b["hash"],
+            "actor": (b.get("details") or {}).get("actor") or b.get("actor"),
+            "details": b.get("details") or {},
+        }
+        for b in blocks
+    ]
+    return {
+        "title": "SecureVault chain-of-custody receipt",
+        "generated_at": utc_now_iso(),
+        "operator": _current_actor(),
+        "status": report.get("status"),
+        "valid": report.get("valid"),
+        "height": ledger.height(),
+        "tip": ledger.tip()["hash"] if blocks else "",
+        "blocks_checked": report.get("blocks_checked"),
+        "note": (
+            "Each block hashes the previous block. If this JSON and the live chain "
+            "still verify as VALID, the log was not silently rewritten."
+        ),
+        "events": events,
+    }
 
 
 def _load_state() -> dict:
@@ -96,18 +309,48 @@ def _append_audit(action: str, target: str, outcome: str = "success", details: d
         prev = _state["audit"][-1]["entry_hash"]
     entry_id = _next_id("AL")
     timestamp = utc_now_iso()
+    actor = _current_actor()
     payload = {
         "id": entry_id,
         "timestamp": timestamp,
-        "actor": ACTOR,
+        "actor": actor,
         "action": action,
         "target": target,
         "outcome": outcome,
-        "details": details or {},
+        "details": {
+            **(details or {}),
+            "actor": actor,
+            "logged_at": timestamp,
+        },
         "prev_hash": prev,
     }
     digest_src = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["entry_hash"] = hashlib.sha256((prev + digest_src).encode("utf-8")).hexdigest()
+    try:
+        ledger_action = ACTION_TO_LEDGER.get(action, action.upper().replace(".", "_"))
+        block = _get_ledger().log(
+            ledger_action,
+            {
+                "target": target,
+                "outcome": outcome,
+                **(details or {}),
+                "actor": actor,
+                "logged_at": timestamp,
+            },
+        )
+        payload["block_index"] = block["index"]
+        payload["block_hash"] = block["hash"]
+        payload["merkle_root"] = block["details_hash"]
+        payload["ledger_action"] = ledger_action
+    except Exception:
+        payload.setdefault("block_index", None)
+        try:
+            block = _get_chain().append_entry(payload)
+            payload["block_index"] = block["index"]
+            payload["block_hash"] = block["hash"]
+            payload["merkle_root"] = block["merkle_root"]
+        except Exception:
+            pass
     _state["audit"].append(payload)
     return payload
 
@@ -150,14 +393,31 @@ def _file_to_frontend(rec: dict, evidence_id: str, recovered_at: str) -> dict:
     label = rec.get("confidence") or "medium"
     if label not in CONFIDENCE_SCORE:
         label = "medium"
-    header_valid = True
+    ai_score = rec.get("ai_confidence")
+    if isinstance(ai_score, (int, float)):
+        score = float(ai_score)
+        if score >= 0.8:
+            label = "high"
+        elif score >= 0.5:
+            label = "medium"
+        else:
+            label = "low"
+    else:
+        score = CONFIDENCE_SCORE[label]
+    method = rec.get("recovery_method") or "signature"
+    header_valid = method == "signature" or label in ("high", "medium")
     footer_valid = label in ("high", "medium")
-    structure_valid = label == "high"
+    structure_valid = method == "signature" and label == "high"
     notes = rec.get("notes") or "structure-aware parse"
-    explanation = (
-        f"{notes}. Signature-based contiguous carve of {rec.get('type')} "
-        f"at byte offset {rec.get('offset_start')}."
-    )
+    if method == "ai_classified":
+        explanation = notes
+        recovery_method = "carved"
+    else:
+        explanation = (
+            f"{notes}. Signature-based contiguous carve of {rec.get('type')} "
+            f"at byte offset {rec.get('offset_start')}."
+        )
+        recovery_method = "carved"
     return {
         "id": f"{evidence_id}-{rec.get('index', 0):04d}",
         "evidence_id": evidence_id,
@@ -165,10 +425,13 @@ def _file_to_frontend(rec: dict, evidence_id: str, recovered_at: str) -> dict:
         "file_type": rec.get("type"),
         "size_bytes": rec.get("size"),
         "offset": rec.get("offset_start"),
-        "recovery_method": "carved",
-        "confidence_score": CONFIDENCE_SCORE[label],
+        "recovery_method": recovery_method,
+        "confidence_score": score,
         "confidence_label": label,
         "ai_explanation": explanation,
+        "ai_confidence": rec.get("ai_confidence"),
+        "entropy": rec.get("entropy"),
+        "classifier": "ai" if method == "ai_classified" else "signature",
         "integrity_checks": {
             "header_valid": header_valid,
             "footer_valid": footer_valid,
@@ -262,10 +525,21 @@ def _dashboard_stats() -> dict:
             {"label": "Low (<0.5)", "count": low},
         ],
         "sessions": sessions,
+        "innovations": {
+            "ssd_aware_erasure": True,
+            "ai_fragment_classifier": True,
+            "blockchain_audit": True,
+            "chain_height": _get_ledger().height(),
+            "chain_valid": bool(verify_chain(_get_ledger().get_chain()).get("valid")),
+        },
+        "mode": MODE,
+        "firmware_simulated": FIRMWARE_SIMULATED,
+        "auth_required": AUTH_REQUIRED,
     }
 
 
-def _run_recovery(evidence_id: str, session_id: str) -> None:
+def _run_recovery(evidence_id: str, session_id: str, actor: str | None = None) -> None:
+    set_actor(actor)
     try:
         with STATE_LOCK:
             evidence = _find_evidence(evidence_id)
@@ -359,7 +633,7 @@ def _start_recovery_locked(evidence: dict) -> dict:
     _save_state()
     thread = threading.Thread(
         target=_run_recovery,
-        args=(evidence["id"], session_id),
+        args=(evidence["id"], session_id, get_actor()),
         daemon=True,
     )
     thread.start()
@@ -421,36 +695,102 @@ def _import_from_path(source: Path, filename: str | None = None) -> dict:
     return item
 
 
+def _device_public(info, rel_name: str) -> dict:
+    drive_type = info.drive_type if info.drive_type in ("HDD", "SSD", "NVMe", "USB") else "USB"
+    return {
+        "name": rel_name,
+        "type": drive_type,
+        "serial": info.serial,
+        "capacity_bytes": info.capacity_bytes or 0,
+        "drive_type": info.drive_type,
+        "model": info.model,
+        "protocol": info.protocol,
+        "recommended_method": info.recommended_method,
+        "recommended_nist_level": info.recommended_nist_level,
+        "overprovisioning_risk": info.overprovisioning_risk,
+        "nist_purge_command": info.nist_purge_command,
+        "capabilities": info.to_dict()["capabilities"],
+        "notes": info.notes,
+    }
+
+
+def _rel_to_root(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _import_erasure_file(data: bytes, filename: str, media: str | None = None) -> dict:
+    """
+    Stage a local file for sanitization the same way evidence import works:
+    copy into workspace. The operator's original path is never opened for write.
+    """
+    if not filename or filename.endswith("/") or filename in (".", ".."):
+        raise ValueError("Uploaded file has no name")
+    safe_name = Path(filename).name
+    ERASURE_UPLOADS.mkdir(parents=True, exist_ok=True)
+    dest = ERASURE_UPLOADS / safe_name
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        dest = ERASURE_UPLOADS / f"{stem}_{utc_now_iso().replace(':', '')}{suffix}"
+    dest.write_bytes(data)
+    media_norm = (media or "FILE").strip().upper()
+    if media_norm not in ("HDD", "SSD", "NVMe", "USB", "FILE"):
+        media_norm = "FILE"
+    meta = {
+        "drive_type": media_norm,
+        "original_filename": safe_name,
+        "imported_at": utc_now_iso(),
+        "notes": (
+            "Operator-uploaded local file. The original on disk is not modified. "
+            "Sanitization overwrites a working COPY only."
+        ),
+        "capacity_bytes": dest.stat().st_size,
+        "model": safe_name,
+        "serial": f"UPLOAD-{dest.stat().st_size}",
+    }
+    dest.with_suffix(dest.suffix + ".meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _append_audit(
+        "erasure.start",
+        _rel_to_root(dest),
+        details={"action": "FILE_STAGED_FOR_ERASURE", "filename": safe_name, "bytes": dest.stat().st_size},
+    )
+    info = detect_device(dest)
+    return _device_public(info, _rel_to_root(dest))
+
+
 def _erasure_devices() -> list[dict]:
     devices = []
+    ERASURE_UPLOADS.mkdir(parents=True, exist_ok=True)
+    for path in sorted(ERASURE_UPLOADS.iterdir(), reverse=True):
+        if not path.is_file() or path.name.startswith(".") or path.name.endswith(".meta.json"):
+            continue
+        info = detect_device(path)
+        devices.append(_device_public(info, _rel_to_root(path)))
+    create_demo_targets(TARGETS_DIR)
+    for path in sorted(TARGETS_DIR.glob("demo_*.bin")):
+        info = detect_device(path)
+        devices.append(_device_public(info, _rel_to_root(path)))
     samples = ROOT / "samples"
     if samples.is_dir():
         for path in sorted(samples.iterdir()):
-            if not path.is_file() or path.name.startswith("."):
+            if not path.is_file() or path.name.startswith(".") or " 2." in path.name:
                 continue
-            devices.append(
-                {
-                    "name": str(path.relative_to(ROOT)),
-                    "type": "USB",
-                    "serial": hashlib.sha256(path.name.encode()).hexdigest()[:12],
-                    "capacity_bytes": path.stat().st_size,
-                }
-            )
-    if not devices:
-        fallback = WORKSPACE / "targets"
-        fallback.mkdir(parents=True, exist_ok=True)
-        demo = fallback / "demo_note.txt"
-        if not demo.exists():
-            demo.write_text("ForensicRecover erasure demo target.\n", encoding="utf-8")
-        devices.append(
-            {
-                "name": str(demo.relative_to(ROOT)),
-                "type": "USB",
-                "serial": "DEMO-TARGET",
-                "capacity_bytes": demo.stat().st_size,
-            }
-        )
+            info = detect_device(path)
+            devices.append(_device_public(info, _rel_to_root(path)))
     return devices
+
+
+def _resolve_erasure_target(device_name: str) -> Path:
+    candidate = Path(device_name)
+    if not candidate.is_absolute():
+        candidate = (ROOT / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if not _safe_under(ROOT, candidate) and not _safe_under(TARGETS_DIR, candidate):
+        raise PermissionError("Erasure targets must live inside the project directory")
+    return candidate
 
 
 def _write_certificate(job: dict) -> Path:
@@ -471,16 +811,36 @@ def _write_certificate(job: dict) -> Path:
     return path
 
 
-def _start_erasure(device_name: str, method: str) -> dict:
-    method = (method or "clear").lower().strip()
+def _public_job(job: dict) -> dict:
+    return {k: v for k, v in job.items() if k not in ("certificate_path",)}
+
+
+def _start_erasure(device_name: str, method: str, operator_id: str | None = None) -> dict:
+    method = (method or "auto").lower().strip()
+    operator_id = operator_id or _current_actor()
     devices = {item["name"]: item for item in _erasure_devices()}
     device = devices.get(device_name)
+    source = _resolve_erasure_target(device_name)
     if not device:
-        raise FileNotFoundError(f"Unknown erasure target: {device_name}")
+        info = detect_device(source)
+        device = _device_public(info, device_name)
 
     job_id = _next_id("SAN")
-    started = utc_now_iso()
-    if method == "destroy":
+    _append_audit(
+        "erasure.start",
+        job_id,
+        details={"method": method, "device": device_name, "drive_type": device.get("type")},
+    )
+    try:
+        result = media_sanitize(
+            source,
+            job_id=job_id,
+            work_dir=ERASURE_DIR / job_id,
+            cert_dir=CERT_DIR,
+            method=method,
+            operator_id=operator_id,
+        )
+    except Exception as exc:
         job = {
             "id": job_id,
             "device": device,
@@ -488,71 +848,83 @@ def _start_erasure(device_name: str, method: str) -> dict:
             "passes_completed": 0,
             "passes_total": 0,
             "status": "failed",
-            "started_at": started,
+            "started_at": utc_now_iso(),
             "completed_at": utc_now_iso(),
             "verification": {"passed": False, "sample_sectors_checked": 0, "residual_data_found": False},
             "certificate_url": None,
-            "details": {"error": "Physical destruction is out of scope. Demo supports clear/purge on a file copy."},
-        }
-        _state["erasure_jobs"].insert(0, job)
-        _append_audit("erasure.start", job_id, outcome="failure", details={"method": method, "device": device_name})
-        _save_state()
-        return job
-
-    source = (ROOT / device_name).resolve()
-    _append_audit("erasure.start", job_id, details={"method": method, "device": device_name})
-    try:
-        result = demo_erase(source, ERASURE_DIR / job_id, method=method)
-    except Exception as exc:
-        job = {
-            "id": job_id,
-            "device": device,
-            "method": method,
-            "passes_completed": 0,
-            "passes_total": 1 if method == "clear" else 3,
-            "status": "failed",
-            "started_at": started,
-            "completed_at": utc_now_iso(),
-            "verification": {"passed": False, "sample_sectors_checked": 0, "residual_data_found": False},
-            "certificate_url": None,
-            "details": {"error": str(exc)},
+            "details": {"error": str(exc), "operator_id": operator_id},
         }
         _state["erasure_jobs"].insert(0, job)
         _append_audit("erasure.complete", job_id, outcome="error", details={"error": str(exc)})
         _save_state()
         return job
-    job = {
-        "id": job_id,
-        "device": device,
-        "method": result.method,
-        "passes_completed": result.passes,
-        "passes_total": result.passes,
-        "status": "completed",
-        "started_at": started,
-        "completed_at": utc_now_iso(),
-        "verification": {
-            "passed": bool(result.verified),
-            "sample_sectors_checked": 1,
-            "residual_data_found": not result.verified,
-        },
-        "certificate_url": None,
-        "details": {
-            "hash_before": result.hash_before,
-            "hash_after": result.hash_after,
-            "working_copy": result.working_copy,
-            "bytes_overwritten": result.bytes_overwritten,
-            "message": result.message,
-        },
-    }
-    cert = _write_certificate(job)
-    job["certificate_url"] = f"/erasure/certificate/{job_id}/file"
-    job["certificate_path"] = str(cert)
+
+    job = result.to_job_dict()
+    job["certificate_path"] = result.details.get("certificate_path")
+    job["compliance_url"] = f"/erasure/compliance/{job_id}"
+    if not job.get("certificate_url"):
+        job["certificate_url"] = f"/erasure/compliance/{job_id}/file"
     _state["erasure_jobs"].insert(0, job)
-    _append_audit("erasure.complete", job_id, details={"method": result.method, "verified": result.verified})
-    _append_audit("erasure.verify", job_id, details={"passed": result.verified})
-    _append_audit("certificate.generate", job_id, details={"path": str(cert)})
+    _append_audit(
+        "erasure.complete",
+        job_id,
+        details={
+            "method": result.technique,
+            "nist_level": result.nist_level,
+            "drive_type": result.device.get("type"),
+            "verified": result.verification.get("passed"),
+        },
+    )
+    _append_audit(
+        "erasure.verify",
+        job_id,
+        details={"passed": result.verification.get("passed"), "sectors": result.verification.get("sample_sectors_checked")},
+    )
+    _append_audit(
+        "certificate.generate",
+        job_id,
+        details={"path": result.details.get("certificate_path"), "sha256": result.details.get("certificate_sha256")},
+    )
     _save_state()
     return job
+
+
+def _health_payload() -> dict:
+    try:
+        chain_report = verify_chain(_get_ledger().get_chain())
+    except Exception as exc:  # noqa: BLE001
+        chain_report = {"valid": False, "status": "ERROR", "reason": str(exc)}
+    try:
+        metrics = accuracy_report()
+        model_loaded = bool((metrics.get("weights") or {}).get("json") or metrics.get("accuracy") is not None)
+    except Exception:
+        metrics = {}
+        model_loaded = False
+    return {
+        "ok": True,
+        "tool": TOOL_NAME,
+        "version": TOOL_VERSION,
+        "mocks": False,
+        "mode": MODE,
+        "bind": HOST,
+        "firmware_simulated": FIRMWARE_SIMULATED,
+        "auth_required": AUTH_REQUIRED,
+        "chain": {
+            "valid": bool(chain_report.get("valid")),
+            "status": chain_report.get("status"),
+            "height": chain_report.get("height"),
+        },
+        "classifier": {
+            "loaded": model_loaded,
+            "accuracy": metrics.get("accuracy"),
+            "dataset": metrics.get("dataset"),
+        },
+        "safety": {
+            "block_devices_refused": True,
+            "evidence_read_only": True,
+            "erasure_copy_only": FIRMWARE_SIMULATED,
+        },
+    }
 
 
 def _safe_under(root: Path, candidate: Path) -> bool:
@@ -575,22 +947,39 @@ class Handler(BaseHTTPRequestHandler):
         # A closed or broken stderr (orphaned process after the terminal exits)
         # must not abort the HTTP response — that shows up as Vite 502s.
         try:
-            sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+            rid = getattr(self, "request_id", "-")
+            log_event("info", fmt % args, request_id=rid, client=self.client_address[0])
         except Exception:
-            pass
+            try:
+                sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+            except Exception:
+                pass
 
     def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin") or ""
+        if cors_origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        elif not origin:
+            self.send_header("Access-Control-Allow-Origin", "http://localhost:5174")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Operator-Id, X-Request-Id")
+        self.send_header("Access-Control-Expose-Headers", "X-Request-Id")
 
     def _send_json(self, payload, status: int = 200) -> None:
+        if status >= 400 and isinstance(payload, dict) and "request_id" not in payload:
+            payload = {
+                **payload,
+                "request_id": getattr(self, "request_id", None),
+                "code": payload.get("code") or f"http_{status}",
+            }
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self._cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-Id", getattr(self, "request_id", ""))
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -667,7 +1056,41 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _begin_request(self) -> None:
+        self.request_id = self.headers.get("X-Request-Id") or new_request_id()
+        token = parse_bearer(self.headers.get("Authorization"))
+        session = resolve_session(token)
+        if session:
+            set_actor(session["operator_id"])
+        else:
+            set_actor(None)
+
+    def _authorize_mutation(self, path: str) -> bool:
+        public = {
+            "/api/v1/auth/login",
+            "/api/auth/login",
+            "/api/v1/auth/register",
+            "/api/auth/register",
+        }
+        if path in public:
+            return True
+        token = parse_bearer(self.headers.get("Authorization"))
+        session = resolve_session(token)
+        if session:
+            user = session["operator_id"]
+            set_actor(user)
+            with STATE_LOCK:
+                _state["actor"] = user
+            return True
+        set_actor(None)
+        self._send_json(
+            {"error": "Sign in with username and password first", "code": "auth_required"},
+            401,
+        )
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
+        self._begin_request()
         try:
             self._handle_get()
         except Exception as exc:  # noqa: BLE001
@@ -681,6 +1104,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self) -> None:  # noqa: N802
+        self._begin_request()
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path).rstrip("/") or "/"
+        if not self._authorize_mutation(path):
+            return
         try:
             self._handle_post()
         except FileNotFoundError as exc:
@@ -708,7 +1136,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"tool": TOOL_NAME, "version": TOOL_VERSION, "api": "/api/v1"})
             return
         if path == "/api/v1/health":
-            self._send_json({"ok": True, "tool": TOOL_NAME, "version": TOOL_VERSION, "mocks": False})
+            with STATE_LOCK:
+                self._send_json(_health_payload())
+            return
+        if path in ("/api/v1/auth/me", "/api/auth/me"):
+            token = parse_bearer(self.headers.get("Authorization"))
+            session = resolve_session(token)
+            if not session:
+                self._send_json({"ok": False, "signed_in": False}, 200)
+                return
+            self._send_json({"ok": True, "signed_in": True, "username": session["operator_id"], "operator_id": session["operator_id"]})
             return
 
         payload = None
@@ -754,6 +1191,78 @@ class Handler(BaseHTTPRequestHandler):
                     file_send = (Path(job.get("certificate_path") or ""), f"{job_id}.pdf")
                 else:
                     payload = {"url": f"/erasure/certificate/{job_id}/file"}
+            elif path.startswith("/api/v1/erasure/compliance/") or path.startswith("/api/erasure/compliance/"):
+                job_id = parts[-1] if parts[-1] != "file" else parts[-2]
+                want_file = parts[-1] == "file"
+                job = next((item for item in _state["erasure_jobs"] if item["id"] == job_id), None)
+                if not job:
+                    payload, status = {"error": "Unknown job"}, 404
+                elif want_file:
+                    file_send = (Path(job.get("certificate_path") or ""), f"{job_id}.pdf")
+                else:
+                    payload = job.get("certificate") or {
+                        "url": job.get("certificate_url"),
+                        "job_id": job_id,
+                    }
+            elif path in ("/api/v1/erasure/detect", "/api/erasure/detect"):
+                query = parse_qs(parsed.query)
+                device = (query.get("device") or [""])[0]
+                if not device:
+                    payload, status = {"error": "device query parameter is required"}, 400
+                else:
+                    # Detection is read-only (sysfs / path heuristics). Do not require
+                    # the path to be an erasure target inside the project tree.
+                    if device.startswith("/dev/"):
+                        payload = detect_device(device).to_dict()
+                    else:
+                        try:
+                            target = _resolve_erasure_target(device)
+                        except PermissionError:
+                            payload = detect_device(device).to_dict()
+                        else:
+                            payload = detect_device(target).to_dict()
+            elif path in ("/api/v1/demo/delete-recover", "/api/demo/delete-recover"):
+                payload = delete_demo.snapshot()
+            elif path.startswith("/api/v1/demo/exhibits/") or path.startswith("/api/demo/exhibits/"):
+                filename = Path(parts[-1]).name
+                dest = (delete_demo.EXHIBITS / filename).resolve()
+                if not _safe_under(delete_demo.EXHIBITS, dest) or not dest.is_file():
+                    payload, status = {"error": "Exhibit not in the live folder (deleted or missing)"}, 404
+                else:
+                    file_send = (dest, filename)
+            elif path.startswith("/api/v1/demo/inbox/") or path.startswith("/api/demo/inbox/"):
+                filename = Path(parts[-1]).name
+                dest = (delete_demo.INBOX / filename).resolve()
+                if not _safe_under(delete_demo.INBOX, dest) or not dest.is_file():
+                    payload, status = {"error": "Not in the pick list"}, 404
+                else:
+                    file_send = (dest, filename)
+            elif path in ("/api/v1/ai/accuracy", "/api/ai/accuracy"):
+                payload = accuracy_report()
+            elif path in ("/api/v1/audit/chain", "/api/audit/chain"):
+                payload = _ledger_public()
+            elif path in ("/api/v1/audit/verify", "/api/audit/verify"):
+                payload = verify_chain(_get_ledger().get_chain())
+            elif path in ("/api/v1/audit/receipt", "/api/audit/receipt"):
+                payload = _custody_receipt()
+            elif path.startswith("/api/v1/audit/block/") or path.startswith("/api/audit/block/"):
+                try:
+                    index = int(parts[-1])
+                except ValueError:
+                    payload, status = {"error": "block index must be an integer"}, 400
+                else:
+                    block = _get_ledger().get_block(index)
+                    if block is None:
+                        payload, status = {"error": "Unknown block"}, 404
+                    else:
+                        payload = _annotate_block(block)
+            elif path.startswith("/api/v1/audit/proof/") or path.startswith("/api/audit/proof/"):
+                entry_id = parts[-1]
+                proof = _get_chain().proof_for(entry_id)
+                if not proof:
+                    payload, status = {"error": "Unknown audit entry"}, 404
+                else:
+                    payload = proof
             elif path.startswith("/api/v1/files/") and len(parts) == 5:
                 evidence_id, filename = parts[3], parts[4]
                 dest = (RECOVERED_DIR / evidence_id / filename).resolve()
@@ -761,6 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
                     payload, status = {"error": "Forbidden"}, 403
                 else:
                     file_send = (dest, filename)
+                    _append_audit("file.export", filename, details={"evidence_id": evidence_id})
             elif path.startswith("/api/v1/reports/") and len(parts) == 5:
                 evidence_id, kind = parts[3], parts[4]
                 folder = RECOVERED_DIR / evidence_id
@@ -822,6 +1332,75 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_public_evidence(item), 201)
             return
 
+        if path in (
+            "/api/v1/demo/delete-recover/upload",
+            "/api/demo/delete-recover/upload",
+        ):
+            if "multipart/form-data" not in ctype:
+                raise ValueError("Upload a file as multipart field 'file'")
+            _fields, files = self._parse_multipart()
+            if "file" not in files:
+                raise ValueError("multipart body must include a file field named 'file'")
+            filename, data = files["file"]
+            with STATE_LOCK:
+                snap = delete_demo.add_uploaded_file(filename, data)
+                _append_audit("demo.upload", filename, details={"bytes": len(data)})
+                _save_state()
+                self._send_json(snap, 201)
+            return
+
+        if path in ("/api/v1/demo/delete-recover", "/api/demo/delete-recover"):
+            body = self._parse_json()
+            action = str(body.get("action") or "").strip().lower()
+            with STATE_LOCK:
+                if action == "stage":
+                    snap = delete_demo.stage(use_samples=bool(body.get("use_samples")))
+                    _append_audit("demo.stage", "suspect_disk.img", details={"files": [p["filename"] for p in snap.get("planted") or []]})
+                    _save_state()
+                    self._send_json(snap, 201)
+                    return
+                if action == "remove":
+                    name = str(body.get("filename") or "")
+                    snap = delete_demo.remove_uploaded_file(name)
+                    _save_state()
+                    self._send_json(snap)
+                    return
+                if action == "delete":
+                    snap = delete_demo.delete_exhibits()
+                    _append_audit("demo.delete", "suspect_disk.img", details={"directory_wiped": True, "folder_empty": True})
+                    _save_state()
+                    self._send_json(snap)
+                    return
+                if action == "reset":
+                    snap = delete_demo.reset()
+                    _append_audit("demo.reset", "suspect_disk.img")
+                    _save_state()
+                    self._send_json(snap)
+                    return
+                if action == "recover":
+                    image = delete_demo.image_path()
+                    item = _import_from_path(image, filename="suspect_disk.img")
+                    snap = delete_demo.mark_recovering(item["id"])
+                    _save_state()
+                    snap["evidence"] = _public_evidence(item)
+                    self._send_json(snap, 202)
+                    return
+            raise ValueError("action must be stage, delete, recover, or reset")
+
+        if path in ("/api/v1/erasure/import", "/api/erasure/import"):
+            if "multipart/form-data" not in ctype:
+                raise ValueError("Upload a file as multipart field 'file' (same as evidence import)")
+            fields, files = self._parse_multipart()
+            if "file" not in files:
+                raise ValueError("multipart body must include a file field named 'file'")
+            filename, data = files["file"]
+            media = fields.get("media") or fields.get("drive_type")
+            with STATE_LOCK:
+                item = _import_erasure_file(data, filename, media=media)
+                _save_state()
+                self._send_json(item, 201)
+            return
+
         if path == "/api/v1/recovery/start":
             body = self._parse_json()
             evidence_id = body.get("evidence_id")
@@ -843,16 +1422,135 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_session_to_results(session), 202)
             return
 
-        if path == "/api/v1/erasure/start":
+        if path in ("/api/v1/erasure/start", "/api/v1/erasure/sanitize", "/api/erasure/sanitize"):
             body = self._parse_json()
-            device = body.get("device") or body.get("deviceName")
-            method = body.get("method") or "clear"
+            device = body.get("device") or body.get("deviceName") or body.get("device_path")
+            method = body.get("method") or ("auto" if "sanitize" in path else "auto")
+            operator_id = _current_actor()
             if not device:
                 raise ValueError("device is required")
             with STATE_LOCK:
-                job = _start_erasure(str(device), str(method))
-                public = {k: v for k, v in job.items() if k != "certificate_path"}
-                self._send_json(public, 201)
+                job = _start_erasure(str(device), str(method), operator_id=str(operator_id))
+                self._send_json(_public_job(job), 201)
+            return
+
+        if path in ("/api/v1/ai/classify", "/api/ai/classify"):
+            fragment = b""
+            if "multipart/form-data" in ctype:
+                _fields, files = self._parse_multipart()
+                if files:
+                    _name, fragment = next(iter(files.values()))
+            else:
+                body = self._parse_json()
+                if body.get("hex"):
+                    fragment = bytes.fromhex(re.sub(r"\s+", "", str(body["hex"])))
+                elif body.get("bytes_b64") or body.get("b64"):
+                    import base64
+
+                    fragment = base64.b64decode(body.get("bytes_b64") or body.get("b64"))
+                elif body.get("text"):
+                    fragment = str(body["text"]).encode("utf-8")
+            if not fragment:
+                raise ValueError("Provide a file upload, hex, or base64 fragment")
+            result = classify_fragment(fragment)
+            with STATE_LOCK:
+                _append_audit(
+                    "ai.classify",
+                    result.file_type,
+                    details={"confidence": result.confidence, "entropy": result.entropy, "method": result.method},
+                )
+                _save_state()
+            self._send_json(result.to_dict())
+            return
+
+        if path in ("/api/v1/auth/register", "/api/auth/register"):
+            body = self._parse_json()
+            username = str(body.get("username") or body.get("operator_id") or "").strip()
+            password = str(body.get("password") or "")
+            profile = users.register(username, password)
+            set_actor(profile["username"])
+            session = issue_session(profile["username"])
+            with STATE_LOCK:
+                _state["actor"] = profile["username"]
+                entry = _append_audit(
+                    "auth.register",
+                    profile["username"],
+                    details={"username": profile["username"], "created_at": profile["created_at"]},
+                )
+                _save_state()
+            self._send_json(
+                {
+                    "ok": True,
+                    "username": profile["username"],
+                    "operator_id": profile["username"],
+                    "token": session["token"],
+                    "expires_at": session["expires_at"],
+                    "created_at": profile["created_at"],
+                    "block_index": entry.get("block_index"),
+                },
+                201,
+            )
+            return
+
+        if path in ("/api/v1/auth/login", "/api/auth/login"):
+            body = self._parse_json()
+            username = str(body.get("username") or body.get("operator_id") or "").strip()
+            password = str(body.get("password") or "")
+            profile = users.authenticate(username, password)
+            set_actor(profile["username"])
+            session = issue_session(profile["username"])
+            with STATE_LOCK:
+                _state["actor"] = profile["username"]
+                entry = _append_audit(
+                    "auth.login",
+                    profile["username"],
+                    details={
+                        "username": profile["username"],
+                        "logged_in_at": profile.get("last_login_at"),
+                    },
+                )
+                _save_state()
+                self._send_json(
+                    {
+                        "ok": True,
+                        "username": profile["username"],
+                        "operator_id": profile["username"],
+                        "token": session["token"],
+                        "expires_at": session["expires_at"],
+                        "last_login_at": profile.get("last_login_at"),
+                        "block_index": entry.get("block_index"),
+                        "mode": MODE,
+                    }
+                )
+            return
+
+        if path in ("/api/v1/auth/me", "/api/auth/me"):
+            token = parse_bearer(self.headers.get("Authorization"))
+            session = resolve_session(token)
+            if not session:
+                self._send_json({"error": "Not signed in", "code": "auth_required"}, 401)
+                return
+            self._send_json({"ok": True, "username": session["operator_id"], "operator_id": session["operator_id"]})
+            return
+
+        if path in ("/api/v1/auth/logout", "/api/auth/logout"):
+            token = parse_bearer(self.headers.get("Authorization"))
+            operator = get_actor()
+            revoke_session(token)
+            with STATE_LOCK:
+                entry = _append_audit("auth.logout", operator, details={"username": operator})
+                _save_state()
+                self._send_json({"ok": True, "block_index": entry.get("block_index")})
+            return
+
+        if path in ("/api/v1/audit/anchor", "/api/audit/anchor"):
+            body = self._parse_json()
+            network = body.get("network") or "simulated-ethereum"
+            with STATE_LOCK:
+                record = _get_chain().anchor(network=str(network))
+                _append_audit("audit.export", record["tx_id"], details=record)
+                _save_state()
+                self._send_json(record, 201)
             return
 
         self._send_json({"error": "Not found", "path": path}, 404)
@@ -867,11 +1565,21 @@ def main(argv: list[str] | None = None) -> int:
     _ensure_dirs()
     global _state
     _state = _load_state()
+    _get_ledger()
+    chain = _get_chain()
+    if _state.get("audit") and chain.height() < len(_state["audit"]):
+        chain.rebuild_from_audit(_state["audit"])
+    threading.Thread(target=ensure_model, daemon=True).start()
 
     httpd = ThreadedServer((args.host, args.port), Handler)
+    log_event("info", "api.start", host=args.host, port=args.port, mode=MODE, firmware_simulated=FIRMWARE_SIMULATED)
     print(f"{TOOL_NAME} {TOOL_VERSION} API  http://{args.host}:{args.port}/api/v1")
+    print(f"Mode: {MODE}  firmware={'simulated' if FIRMWARE_SIMULATED else 'LIVE-DANGER'}  auth_required={AUTH_REQUIRED}")
     print("Frontend: cd frontend && npm run dev")
     print("Demo import: POST /api/v1/evidence/import  {\"demo\": true}")
+    print("SSD-aware sanitize: POST /api/v1/erasure/sanitize")
+    print("AI classify:        POST /api/v1/ai/classify")
+    print("Blockchain verify:  GET  /api/v1/audit/verify")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

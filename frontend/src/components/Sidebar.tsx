@@ -1,4 +1,6 @@
-import { NavLink, useLocation } from 'react-router';
+import { NavLink, useLocation, useNavigate } from 'react-router';
+import { clearSession, getOperator } from '../auth';
+import { logoutOperator } from '../api/recovery';
 import {
   LayoutDashboard,
   Database,
@@ -9,6 +11,7 @@ import {
   FileBarChart,
   ScrollText,
   Settings,
+  Brain,
 } from 'lucide-react';
 
 const SECTIONS = [
@@ -21,13 +24,15 @@ const SECTIONS = [
     items: [
       { path: '/import#library', label: 'Evidence Library', icon: Database },
       { path: '/import', label: 'Import Evidence', icon: Upload },
+      { path: '/demo/delete-recover', label: 'Delete → Recover', icon: FileSearch },
     ],
   },
   {
     title: 'OPERATIONS',
     items: [
       { path: '/recovery/results', label: 'Recovery', icon: HardDrive },
-      { path: '/erasure', label: 'Erasure', icon: ShieldOff },
+      { path: '/erasure/ssd', label: 'SSD-Aware Erasure', icon: ShieldOff },
+      { path: '/ai/classifier', label: 'AI Classifier', icon: Brain },
     ],
   },
   {
@@ -40,7 +45,7 @@ const SECTIONS = [
   {
     title: 'SYSTEM',
     items: [
-      { path: '/audit', label: 'Audit Trail', icon: ScrollText },
+      { path: '/audit/chain', label: 'Blockchain Audit', icon: ScrollText },
       { path: '/settings', label: 'Settings', icon: Settings },
     ],
   }
@@ -48,6 +53,18 @@ const SECTIONS = [
 
 export default function Sidebar() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const user = getOperator();
+
+  const signOut = async () => {
+    try {
+      await logoutOperator();
+    } catch {
+      /* still clear local session */
+    }
+    clearSession();
+    navigate('/login', { replace: true });
+  };
 
   return (
     <aside className="fixed left-0 top-0 bottom-0 w-[240px] flex flex-col border-r"
@@ -108,8 +125,11 @@ export default function Sidebar() {
       
       {/* Footer */}
       <div className="px-6 py-4 border-t text-[11px] font-mono text-muted" style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}>
-        ForensicRecover 1.0.0-mvp<br/>
-        local-operator
+        Signed in as<br/>
+        <span style={{ color: 'var(--color-text-primary)' }}>{user}</span>
+        <button type="button" className="btn-ghost p-0 mt-2 text-[11px]" onClick={() => void signOut()}>
+          Sign out
+        </button>
       </div>
     </aside>
   );

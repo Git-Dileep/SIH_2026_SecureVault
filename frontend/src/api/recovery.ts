@@ -1,4 +1,4 @@
-import type { Evidence, RecoveryResultsResponse, DashboardStats, HealthStatus } from '../types';
+import type { DeleteRecoverDemo, Evidence, RecoveryResultsResponse, DashboardStats, HealthStatus } from '../types';
 import { apiGet, apiPost, apiUpload } from './client';
 import { mockEvidence } from './mocks/evidence';
 import { mockRecoveryResults } from './mocks/recovery';
@@ -68,4 +68,44 @@ export function getDashboardStats(): Promise<DashboardStats> {
 
 export function getHealth(): Promise<HealthStatus> {
   return apiGet('/health', { ok: true, tool: 'ForensicRecover', version: 'mock', mocks: true });
+}
+
+export function loginOperator(username: string, password: string): Promise<{ ok: boolean; username: string; operator_id: string; token?: string }> {
+  return apiPost('/auth/login', { username, password }, { ok: true, username, operator_id: username, token: 'mock-token' });
+}
+
+export function registerOperator(username: string, password: string): Promise<{ ok: boolean; username: string; operator_id: string; token?: string }> {
+  return apiPost('/auth/register', { username, password }, { ok: true, username, operator_id: username, token: 'mock-token' });
+}
+
+export function logoutOperator(): Promise<{ ok: boolean }> {
+  return apiPost('/auth/logout', {}, { ok: true });
+}
+
+const mockDemo: DeleteRecoverDemo = {
+  phase: 'empty',
+  exhibits_folder: [],
+  directory: [],
+  planted: [],
+};
+
+export function getDeleteRecoverDemo(): Promise<DeleteRecoverDemo> {
+  return apiGet('/demo/delete-recover', mockDemo);
+}
+
+export function runDeleteRecoverDemo(
+  action: 'stage' | 'delete' | 'recover' | 'reset' | 'remove',
+  extra?: { use_samples?: boolean; filename?: string },
+): Promise<DeleteRecoverDemo> {
+  return apiPost(
+    '/demo/delete-recover',
+    { action, ...extra },
+    { ...mockDemo, phase: action === 'stage' ? 'staged' : action === 'delete' ? 'deleted' : 'recovering' },
+  );
+}
+
+export function uploadDemoExhibit(file: File): Promise<DeleteRecoverDemo> {
+  const form = new FormData();
+  form.append('file', file);
+  return apiUpload('/demo/delete-recover/upload', form, mockDemo);
 }
